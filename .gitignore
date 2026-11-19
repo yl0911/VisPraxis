@@ -1,0 +1,11 @@
+node_modules/
+.npm-cache/
+dist/
+.env
+.env.local
+*.log
+__pycache__/
+*.py[cod]
+apps/api/data/
+.DS_Store
+

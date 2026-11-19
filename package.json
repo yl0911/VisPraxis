@@ -1,0 +1,18 @@
+{
+  "name": "vispraxis",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "dev": "concurrently -n api,web -c green,cyan \"npm run dev -w @vispraxis/api\" \"npm run dev -w @vispraxis/web\"",
+    "build": "npm run build -w @vispraxis/contracts && npm run build -w @vispraxis/api && npm run build -w @vispraxis/web",
+    "typecheck": "npm run typecheck -ws --if-present"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2",
+    "typescript": "^5.7.3"
+  }
+}
