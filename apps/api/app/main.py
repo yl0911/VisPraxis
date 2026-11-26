@@ -5,6 +5,7 @@ import os
 import string
 import re
 import shutil
+import hashlib
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
@@ -324,6 +325,8 @@ def version_previews(
     candidates, _ = repository.list_assets(source_id, 0, 10_000_000, None, None, status_path, search)
     grouped: dict[str, dict] = {}
     for asset in candidates:
+        if asset.role != "primary":
+            continue
         dataset = _asset_dataset(source, asset.hierarchy)
         if not dataset or dataset[1] != branch or (category and dataset[0] != category):
             continue
@@ -333,6 +336,31 @@ def version_previews(
         if len(group["items"]) < limit_per_version:
             group["items"].append(asset)
     return {"items": [grouped[key] for key in sorted(grouped, reverse=True)]}
+
+
+@app.get("/api/data-sources/{source_id}/branch-previews")
+def branch_previews(
+    source_id: str,
+    category: str = Query(min_length=1),
+    status_path: list[str] = Query(default=[]),
+    search: str | None = None,
+    limit_per_branch: int = Query(default=10, ge=1, le=20),
+):
+    source = _source_or_404(source_id)
+    candidates, _ = repository.list_assets(source_id, 0, 10_000_000, None, None, status_path, search)
+    grouped: dict[str, dict] = {}
+    for asset in candidates:
+        if asset.role != "primary":
+            continue
+        dataset = _asset_dataset(source, asset.hierarchy)
+        if not dataset or dataset[0] != category:
+            continue
+        branch = dataset[1]
+        group = grouped.setdefault(branch, {"branch": branch, "total": 0, "items": []})
+        group["total"] += 1
+        if len(group["items"]) < limit_per_branch:
+            group["items"].append(asset)
+    return {"items": [grouped[key] for key in sorted(grouped, key=str.casefold)]}
 
 
 @app.get("/api/data-sources/{source_id}/assets")
@@ -377,7 +405,7 @@ def source_hierarchy(source_id: str):
         for depth in range(1, len(parts) + 1):
             directory_paths.add("/".join([Path(source.endpoint).name, *parts[:depth]]))
         dataset = _asset_dataset(source, asset.hierarchy)
-        if dataset:
+        if dataset and asset.role == "primary":
             category, branch, version = dataset
             versions = categories.setdefault(category, {}).setdefault(branch, {})
             versions[version] = versions.get(version, 0) + 1
@@ -451,6 +479,8 @@ def analyze_source_hierarchy(source_id: str):
         result = analyze_data_hierarchy(source.name, directory_counts, source.options.get("hierarchy_examples", {}), file_samples)
     except (ValueError, RuntimeError) as error:
         raise HTTPException(status_code=422, detail=str(error)) from error
+    result["mappings"] = _respect_source_root_boundary(source, result["mappings"])
+    result["mappings"] = _ground_hierarchy_to_source(source, result["mappings"])
     source.options = {
         **source.options,
         "dataset_mappings": result["mappings"],
@@ -465,6 +495,61 @@ def analyze_source_hierarchy(source_id: str):
         "dataset_count": len({(item["category"], item["branch"], item["version"]) for item in result["mappings"]}),
         "reindexed_assets": reindexed.asset_count,
     }
+
+
+def _respect_source_root_boundary(source: DataSource, mappings: list[dict]) -> list[dict]:
+    """Prevent a provider parent and domain suffix from replacing real task branches."""
+    source_dir = Path(source.endpoint).name
+    parent_dir = Path(source.endpoint).parent.name
+    prefix = f"{parent_dir}_"
+    if not parent_dir or not source_dir.casefold().startswith(prefix.casefold()):
+        return mappings
+    domain = source_dir[len(prefix):].strip("_ -")
+    if not domain:
+        return mappings
+    normalized = []
+    changed = False
+    for mapping in mappings:
+        item = dict(mapping)
+        parts = str(item.get("path_prefix", "")).replace("\\", "/").strip("/").split("/")
+        category = str(item.get("category", ""))
+        branch = str(item.get("branch", ""))
+        if category.casefold() in {source_dir.casefold(), parent_dir.casefold()}:
+            item["category"] = domain
+            item["reason"] = f"根目录边界规则：从大类中移除来源前缀 {parent_dir}，保留领域 {domain}"
+            if parts and branch.casefold() == domain.casefold():
+                item["branch"] = parts[0]
+            changed = True
+        normalized.append(item)
+    if changed:
+        return normalized
+    return mappings
+
+
+def _ground_hierarchy_to_source(source: DataSource, mappings: list[dict]) -> list[dict]:
+    """Reject semantic labels invented by the model instead of observed in the source tree."""
+    source_dir = Path(source.endpoint).name
+    parent_dir = Path(source.endpoint).parent.name
+    grounded_categories = {source_dir.casefold(), parent_dir.casefold()}
+    for name in (source_dir, parent_dir):
+        grounded_categories.update(part.casefold() for part in re.split(r"[_\-\s]+", name) if part)
+    for mapping in mappings:
+        prefix = str(mapping.get("path_prefix", "")).replace("\\", "/").strip("/")
+        grounded_categories.update(part.casefold() for part in prefix.split("/") if part)
+
+    normalized = []
+    for mapping in mappings:
+        item = dict(mapping)
+        prefix = str(item.get("path_prefix", "")).replace("\\", "/").strip("/")
+        parts = [part for part in prefix.split("/") if part]
+        if str(item.get("category", "")).casefold() not in grounded_categories:
+            item["category"] = source_dir
+            item["reason"] = f"目录约束：AI 大类缺少真实目录依据，回退为数据源目录 {source_dir}"
+        version = str(item.get("version", "")).strip()
+        if version.casefold() != "unknown" and version.casefold() not in {part.casefold() for part in parts}:
+            item["version"] = "unknown"
+        normalized.append(item)
+    return normalized
 
 
 def _asset_dataset(source: DataSource, hierarchy: list[str]) -> tuple[str, str, str] | None:
@@ -493,9 +578,13 @@ def _source_datasets(source: DataSource):
             continue
         entry = grouped.setdefault(dataset, {
             "category": dataset[0], "branch": dataset[1], "version": dataset[2],
-            "image_count": 0, "annotation_count": 0,
+            "group_count": 0, "file_count": 0, "image_count": 0, "annotation_count": 0,
         })
-        entry["image_count"] = int(entry["image_count"]) + 1
+        if asset.role != "primary":
+            continue
+        entry["group_count"] = int(entry["group_count"]) + 1
+        entry["file_count"] = int(entry["file_count"]) + 1 + len(asset.companion_images)
+        entry["image_count"] = entry["file_count"]
         if asset.xml:
             entry["annotation_count"] = int(entry["annotation_count"]) + 1
     return sorted(grouped.values(), key=lambda item: (str(item["category"]), str(item["branch"]), str(item["version"])), reverse=True)
@@ -529,43 +618,69 @@ def synchronize_to_storage(source_id: str, payload: StorageSyncRequest):
     selected = None if not payload.dataset else (
         payload.dataset.category, payload.dataset.branch, payload.dataset.version,
     )
-    copied = skipped = updated = annotations = groups = companions = 0
+    copied = skipped = updated = annotations = groups = companions = renamed_groups = 0
     datasets: set[tuple[str, str, str]] = set()
+    selected_assets = []
+    filename_counts: Counter[tuple[tuple[str, str, str], str]] = Counter()
     for asset in assets:
         if asset.role != "primary":
             continue
         dataset = _asset_dataset(source, asset.hierarchy)
         if not dataset or (selected and dataset != selected):
             continue
+        selected_assets.append((asset, dataset))
+        filename_counts[(dataset, Path(asset.relative_path).name.casefold())] += 1
+
+    for asset, dataset in selected_assets:
         datasets.add(dataset)
         destination_dir = storage_root.joinpath(*dataset).resolve()
         if not destination_dir.is_relative_to(storage_root):
             raise HTTPException(status_code=422, detail="数据集标准路径无效")
-        destination_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            destination_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=f"标准目录不可写：{destination_dir}。请检查目录权限或存储配置。",
+            ) from exc
         groups += 1
+        primary_source = (source_root / asset.relative_path).resolve()
+        primary_name = primary_source.name
+        if filename_counts[(dataset, primary_name.casefold())] > 1:
+            digest = hashlib.sha1(asset.relative_path.replace("\\", "/").encode("utf-8")).hexdigest()[:10]
+            primary_name = f"{primary_source.stem}__{digest}{primary_source.suffix.lower()}"
+            renamed_groups += 1
+        target_stem = Path(primary_name).stem
         group_paths = [asset.relative_path, *asset.companion_images]
         companions += len(asset.companion_images)
-        for relative_path in group_paths:
+        for index, relative_path in enumerate(group_paths):
             source_image = (source_root / relative_path).resolve()
             if not source_image.is_relative_to(source_root) or not source_image.is_file():
                 continue
-            destination_image = destination_dir / source_image.name
+            destination_name = primary_name if index == 0 else f"{target_stem}_{index}{source_image.suffix.lower()}"
+            destination_image = destination_dir / destination_name
             if destination_image.exists() and not payload.overwrite:
                 skipped += 1
             else:
                 existed = destination_image.exists()
-                shutil.copy2(source_image, destination_image)
+                try:
+                    shutil.copy2(source_image, destination_image)
+                except OSError as exc:
+                    raise HTTPException(status_code=422, detail=f"无法写入标准目录文件：{destination_image}") from exc
                 updated += int(existed)
                 copied += int(not existed)
         if asset.xml:
             source_xml = (source_root / asset.xml.path).resolve()
-            destination_xml = destination_dir / f"{Path(asset.relative_path).stem}.xml"
+            destination_xml = destination_dir / f"{target_stem}.xml"
             if source_xml.is_relative_to(source_root) and source_xml.is_file():
                 if destination_xml.exists() and not payload.overwrite:
                     skipped += 1
                 else:
                     existed = destination_xml.exists()
-                    shutil.copy2(source_xml, destination_xml)
+                    try:
+                        shutil.copy2(source_xml, destination_xml)
+                    except OSError as exc:
+                        raise HTTPException(status_code=422, detail=f"无法写入标准目录标注：{destination_xml}") from exc
                     updated += int(existed)
                     copied += int(not existed)
                     annotations += 1
@@ -580,6 +695,7 @@ def synchronize_to_storage(source_id: str, payload: StorageSyncRequest):
         "annotations": annotations,
         "groups": groups,
         "companions": companions,
+        "renamed_groups": renamed_groups,
         "overwrite": payload.overwrite,
         "storage_path": str(storage_root),
     }

@@ -1514,8 +1514,26 @@ function SearchableSelect({
     setOpen(false);
   }
 
+  useEffect(() => {
+    if (disabled) { setOpen(false); setQuery(""); }
+  }, [disabled]);
+
+  function openAndFocus() {
+    if (disabled) return;
+    setOpen(true);
+    inputRef.current?.focus();
+  }
+
   return (
-    <div className={`filter-select ${open ? "open" : ""} ${className}`.trim()}>
+    <div
+      className={`filter-select ${open ? "open" : ""} ${className}`.trim()}
+      onMouseDown={(event) => {
+        if (event.target === event.currentTarget) {
+          event.preventDefault();
+          openAndFocus();
+        }
+      }}
+    >
       <input
         ref={inputRef}
         aria-label={ariaLabel}
@@ -1533,7 +1551,14 @@ function SearchableSelect({
         }}
         onBlur={() => window.setTimeout(() => { setQuery(""); setOpen(false); }, 120)}
       />
-      <ChevronRight className="filter-select-chevron" size={13} />
+      <button
+        type="button"
+        className="filter-select-toggle"
+        aria-label={`${ariaLabel}选项`}
+        disabled={disabled}
+        onMouseDown={(event) => event.preventDefault()}
+        onClick={() => { if (open) { setQuery(""); setOpen(false); inputRef.current?.blur(); } else openAndFocus(); }}
+      ><ChevronRight className="filter-select-chevron" size={13} /></button>
       {open && <div className="filter-select-menu" role="listbox">
         {emptyLabel && !normalizedQuery && <button type="button" className={!value ? "selected" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => select("")}><span>{emptyLabel}</span>{!value && <Check size={12} />}</button>}
         {visibleOptions.map((option) => <button type="button" className={option.value === value ? "selected" : ""} role="option" aria-selected={option.value === value} key={option.value} onMouseDown={(event) => event.preventDefault()} onClick={() => select(option.value)}><span>{option.label}</span>{option.value === value && <Check size={12} />}</button>)}
@@ -1554,9 +1579,11 @@ function IndexedImageBrowser() {
   const [examples, setExamples] = useState({ type: "", branch: "", version: "" });
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([...dataViewSession.statuses]);
   const [statusDraft, setStatusDraft] = useState("");
+  const [branchGroups, setBranchGroups] = useState<{ branch: string; total: number; items: IndexedAsset[] }[]>([]);
   const [versionGroups, setVersionGroups] = useState<{ version: string; total: number; items: IndexedAsset[] }[]>([]);
   const [assets, setAssets] = useState<IndexedAsset[]>([]);
   const [selectedId, setSelectedId] = useState(dataViewSession.selectedAssetId);
+  const [inspectorPreviewPath, setInspectorPreviewPath] = useState("");
   const [strategy, setStrategy] = useState<"primary" | "groups" | "annotated">(dataViewSession.strategy);
   const [search, setSearch] = useState(dataViewSession.search);
   const [page, setPage] = useState(dataViewSession.page);
@@ -1587,15 +1614,20 @@ function IndexedImageBrowser() {
   }, [sourceId]);
 
   useEffect(() => {
-    if (!sourceId) { setHierarchyInfo(null); setAssets([]); setVersionGroups([]); return; }
-    fetch(`/api/data-sources/${sourceId}/hierarchy`).then((response) => response.json()).then((result) => {
+    setHierarchyInfo(null);
+    setHierarchyMessage("");
+    setExamples({ type: "", branch: "", version: "" });
+    if (!sourceId) { setAssets([]); setVersionGroups([]); return; }
+    const controller = new AbortController();
+    fetch(`/api/data-sources/${sourceId}/hierarchy`, { signal: controller.signal }).then((response) => response.json()).then((result) => {
       setHierarchyInfo(result);
       setExamples({ type: result.examples?.type || result.type, branch: result.examples?.branch || "", version: result.examples?.version || "" });
-    });
+    }).catch((error) => { if (error.name !== "AbortError") setHierarchyInfo(null); });
+    return () => controller.abort();
   }, [sourceId]);
 
   useEffect(() => {
-    if (!sourceId || (branch && !version)) return;
+    if (!sourceId || (category && !branch) || (branch && !version)) { setAssets([]); return; }
     const controller = new AbortController();
     setLoading(true);
     const params = new URLSearchParams({ skip: String(page * pageSize), limit: String(pageSize) });
@@ -1617,6 +1649,26 @@ function IndexedImageBrowser() {
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, [sourceId, category, branch, version, page, search, selectedStatuses]);
+
+  useEffect(() => {
+    if (!sourceId || !category || branch || !hierarchyInfo) { setBranchGroups([]); return; }
+    const controller = new AbortController();
+    setLoading(true);
+    const params = new URLSearchParams({ category, limit_per_branch: "10" });
+    if (search) params.set("search", search);
+    selectedStatuses.forEach((path) => params.append("status_path", path));
+    fetch(`/api/data-sources/${sourceId}/branch-previews?${params}`, { signal: controller.signal })
+      .then((response) => response.json())
+      .then((result: { items: { branch: string; total: number; items: IndexedAsset[] }[] }) => {
+        const groups = result.items || [];
+        setBranchGroups(groups.filter((group) => group.total > 0));
+        const groupedItems = groups.flatMap((group) => group.items);
+        setSelectedId((current) => groupedItems.some((item) => item.id === current) ? current : groupedItems[0]?.id || "");
+        setTotal(groups.reduce((sum, group) => sum + group.total, 0));
+      }).catch((error) => { if (error.name !== "AbortError") setBranchGroups([]); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [sourceId, category, branch, hierarchyInfo, search, selectedStatuses]);
 
   useEffect(() => {
     if (!sourceId || !branch || version || !hierarchyInfo) { setVersionGroups([]); return; }
@@ -1647,9 +1699,13 @@ function IndexedImageBrowser() {
     return !isCompanion(asset);
   });
   const visibleAssets = applyStrategy(assets);
+  const groupedBranchVisible = branchGroups.map((group) => ({ ...group, items: applyStrategy(group.items) }));
   const groupedVisible = versionGroups.map((group) => ({ ...group, items: applyStrategy(group.items) }));
-  const allVisible = branch && !version ? groupedVisible.flatMap((group) => group.items) : visibleAssets;
+  const allVisible = category && !branch
+    ? groupedBranchVisible.flatMap((group) => group.items)
+    : branch && !version ? groupedVisible.flatMap((group) => group.items) : visibleAssets;
   const selected = allVisible.find((item) => item.id === selectedId) || allVisible[0];
+  useEffect(() => { setInspectorPreviewPath(""); }, [selected?.id]);
   const strategyLabel = { primary: "原图", groups: "数据组", annotated: "标注图像" }[strategy];
   const contentUrl = (asset: IndexedAsset) =>
     `/api/data-sources/${asset.source_id}/assets/${asset.id}/content`;
@@ -1735,7 +1791,7 @@ function IndexedImageBrowser() {
           value={sourceId}
           placeholder="选择或输入类型 / 数据集"
           options={sources.map((item) => ({ value: item.id, label: item.name, keywords: item.endpoint }))}
-          onChange={(nextValue) => { setSourceId(nextValue); setCategory(""); setBranch(""); setVersion(""); setSelectedStatuses([]); setPage(0); }}
+          onChange={(nextValue) => { setHierarchyInfo(null); setHierarchyMessage(""); setSourceId(nextValue); setCategory(""); setBranch(""); setVersion(""); setSelectedStatuses([]); setPage(0); }}
         />
       </section>
       {sourceId && hierarchyInfo && <section className="hierarchy-examples">
@@ -1785,16 +1841,17 @@ function IndexedImageBrowser() {
         <section className="browser-empty"><ImageIcon size={24} /><b>先选择类型 / 数据集</b><span>未选择时不读取、不展示任何图像。</span></section>
       ) : (
         <div className="asset-layout">
-          <section className={branch && !version ? "version-groups" : "asset-grid"}>
+          <section className={(category && !branch) || (branch && !version) ? "version-groups" : "asset-grid"}>
             {loading && <div className="browser-loading"><RefreshCw className="spin" />正在读取索引</div>}
             {!loading && allVisible.length === 0 && <div className="browser-loading">当前层级和状态条件下没有图像</div>}
-            {!loading && branch && !version && groupedVisible.map((group) => <section className="version-row" key={group.version}><header><span><small>版本</small><b>{group.version}</b><em>{group.total} 个资产 · 展示前 {Math.min(10, group.items.length)} 个</em></span><button onClick={() => { setVersion(group.version); setPage(0); }}>查看全部 <ChevronRight size={13} /></button></header><div className="asset-grid">{group.items.map(assetCard)}</div></section>)}
-            {!loading && (!branch || version) && visibleAssets.map(assetCard)}
+            {!loading && category && !branch && groupedBranchVisible.map((group) => <section className="version-row branch-row" key={group.branch}><header><span><small>分支</small><b>{group.branch}</b><em>{group.total} 个数据组 · 展示前 {Math.min(10, group.items.length)} 个</em></span><button onClick={() => { setBranch(group.branch); setVersion(""); setPage(0); }}>进入分支 <ChevronRight size={13} /></button></header><div className="asset-grid">{group.items.map(assetCard)}</div></section>)}
+            {!loading && branch && !version && groupedVisible.map((group) => <section className="version-row" key={group.version}><header><span><small>版本</small><b>{group.version}</b><em>{group.total} 个数据组 · 展示前 {Math.min(10, group.items.length)} 个</em></span><button onClick={() => { setVersion(group.version); setPage(0); }}>查看全部 <ChevronRight size={13} /></button></header><div className="asset-grid">{group.items.map(assetCard)}</div></section>)}
+            {!loading && ((!category && !branch) || version) && visibleAssets.map(assetCard)}
           </section>
           <aside className="asset-inspector">
-            <header><span><small>原图与关联信息</small><h3>{selected?.filename || "未选择"}</h3></span></header>
+            <header><span><small>{inspectorPreviewPath ? "关联小图预览" : "原图与关联信息"}</small><h3>{inspectorPreviewPath.split(/[\\/]/).pop() || selected?.filename || "未选择"}</h3></span>{inspectorPreviewPath && <button title="返回原图" onClick={() => setInspectorPreviewPath("")}><ImageIcon size={15} /></button>}</header>
             {selected && <>
-              <div className="asset-preview"><img src={contentUrl(selected)} /></div>
+              <div className="asset-preview"><img src={inspectorPreviewPath ? relatedContentUrl(selected, inspectorPreviewPath) : contentUrl(selected)} /></div>
               <dl>
                 <div><dt>组合类型</dt><dd><span className="role-tag">{combination}</span></dd></div>
                 <div><dt>目录层级</dt><dd>{selected.hierarchy.join(" / ") || "根目录"}</dd></div>
@@ -1802,12 +1859,19 @@ function IndexedImageBrowser() {
                 <div><dt>XML 标注</dt><dd>{selected.xml ? `${selected.xml.path} · ${selected.xml.object_count} 个目标` : "无"}</dd></div>
                 <div><dt>关联状态</dt><dd className="ok"><CircleCheck size={12} />索引只读关联</dd></div>
               </dl>
+              {selected.companion_images.length > 0 && <section className="inspector-companions">
+                <header><span><small>数据组参考</small><b>关联小图</b></span><em>{selected.companion_images.length}</em></header>
+                <div>{selected.companion_images.map((path, index) => <button className={inspectorPreviewPath === path ? "selected" : ""} title={path} onClick={() => setInspectorPreviewPath(path)} key={path}>
+                  <img src={relatedContentUrl(selected, path)} loading="lazy" alt={`关联小图 ${index + 1}`} />
+                  <span><b>小图 {index + 1}</b><small>{path.split(/[\\/]/).pop()}</small></span>
+                </button>)}</div>
+              </section>}
               {selected.xml && <div className="paired-preview xml-preview"><span><small>XML 类别统计</small><b>{selected.xml.path}</b></span><code>{Object.entries(selected.xml.classes).map(([key, value]) => `${key}: ${value}`).join(" · ")}</code></div>}
             </>}
           </aside>
         </div>
       )}
-      {(!branch || version) && sourceId && <section className="pagination">
+      {(!category || version) && sourceId && <section className="pagination">
         <span>第 {total ? page * pageSize + 1 : 0}–{Math.min((page + 1) * pageSize, total)} 项，共 {total.toLocaleString()} 个索引资产</span>
         <div>
           <button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}><ChevronLeft size={14} /></button>
@@ -2743,8 +2807,8 @@ function FavoriteTools() {
 }
 
 function ImportExport() {
-  type SyncDataset = { category: string; branch: string; version: string; image_count: number; annotation_count: number };
-  type SyncResult = { source_id: string; dataset_count: number; copied: number; updated: number; skipped: number; annotations: number; storage_path: string };
+  type SyncDataset = { category: string; branch: string; version: string; group_count: number; file_count: number; image_count: number; annotation_count: number };
+  type SyncResult = { source_id: string; dataset_count: number; copied: number; updated: number; skipped: number; annotations: number; groups: number; companions: number; renamed_groups: number; storage_path: string };
   const [sources, setSources] = useState<ManagedSource[]>([]);
   const [sourceId, setSourceId] = useState("");
   const [datasets, setDatasets] = useState<SyncDataset[]>([]);
@@ -2796,7 +2860,7 @@ function ImportExport() {
       const sourceName = sources.find((item) => item.id === sourceId)?.name || sourceId;
       const dataset = selectedDataset ? `${selectedDataset.category} / ${selectedDataset.branch} / ${selectedDataset.version}` : "全部数据集";
       setHistory((current) => [{ ...body, source_name: sourceName, dataset, time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }, ...current]);
-      setMessage(`同步完成：新增 ${body.copied}，更新 ${body.updated}，跳过重复 ${body.skipped}`);
+      setMessage(`同步完成：${body.groups} 个数据组，新增 ${body.copied}，更新 ${body.updated}，跳过重复 ${body.skipped}${body.renamed_groups ? `；${body.renamed_groups} 个重名组已安全改名` : ""}`);
     }
     setBusy(false);
   }
@@ -2807,7 +2871,7 @@ function ImportExport() {
         <div className="sync-form">
           <label><span>数据源</span><select value={sourceId} onChange={(event) => setSourceId(event.target.value)}><option value="">选择本地数据源</option>{sources.map((source) => <option value={source.id} key={source.id}>{source.name}</option>)}</select><small>来源目录保持只读，图像和同名 XML 会录入标准目录。</small></label>
           <ArrowRight size={18} />
-          <label><span>同步范围</span><select value={datasetKey} onChange={(event) => { setDatasetKey(event.target.value); setOverwrite(false); }} disabled={!sourceId}><option value="">全部数据集（仅新增）</option>{datasets.map((item) => { const key = JSON.stringify([item.category, item.branch, item.version]); return <option value={key} key={key}>{item.category} / {item.branch} / {item.version} · {item.image_count} 图</option>; })}</select><small>{datasets.length ? `识别到 ${datasets.length} 个标准数据集` : "请先在数据管理中为来源建立索引"}</small></label>
+          <label><span>同步范围</span><select value={datasetKey} onChange={(event) => { setDatasetKey(event.target.value); setOverwrite(false); }} disabled={!sourceId}><option value="">全部数据集（仅新增）</option>{datasets.map((item) => { const key = JSON.stringify([item.category, item.branch, item.version]); return <option value={key} key={key}>{item.category} / {item.branch} / {item.version} · {item.group_count} 组 / {item.file_count} 文件</option>; })}</select><small>{datasets.length ? `识别到 ${datasets.length} 个标准数据集` : "请先在数据管理中为来源建立索引"}</small></label>
           <ArrowRight size={18} />
           <div className="sync-target"><span>标准目录</span><b>大类 / 分支 / 版本</b><small>版本以下目录会被消除，文件直接汇总录入。</small></div>
         </div>

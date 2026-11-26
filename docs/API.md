@@ -25,7 +25,8 @@ VisPraxis API 基于 FastAPI，开发环境默认监听 `http://127.0.0.1:4101`�
 | `PUT` | `/api/data-sources/{source_id}/hierarchy-config` | 保存层级示例和状态路径 |
 | `POST` | `/api/data-sources/{source_id}/hierarchy/analyze` | 使用 LLM 分析层级和数据组匹配规则，并重新索引 |
 | `GET` | `/api/data-sources/{source_id}/datasets` | 获取已识别的标准数据集 |
-| `GET` | `/api/data-sources/{source_id}/version-previews` | 单次获取分支下各版本的预览资产 |
+| `GET` | `/api/data-sources/{source_id}/branch-previews` | 单次获取类型下各分支的主图数据组预览 |
+| `GET` | `/api/data-sources/{source_id}/version-previews` | 单次获取分支下各版本的主图数据组预览 |
 | `POST` | `/api/data-sources/{source_id}/storage-sync` | 按数据组同步到标准目录 |
 | `GET` | `/api/data-sources/{source_id}/content` | 按相对路径读取本地图像 |
 | `GET` | `/api/data-sources/{source_id}/assets/{asset_id}/content` | 读取指定资产图像 |
@@ -133,7 +134,11 @@ Content-Type: application/json
 - 最多发送 120 条代表目录和 60 条文件名样本。
 - 不发送图像、XML 内容或文件二进制。
 - 返回类型、分支、版本映射，以及内容目录角色和伴随图后缀规则。
-- 规则经过白名单校验后保存，并自动重新索引数据源。
+- 所选数据源根目录是层级边界；来源或产品父目录不会被追加为标准层级。
+- AI 不能创建缺少真实目录依据的语义大类或版本；无版本目录时统一使用 `unknown`。
+- 规则经过目录约束和白名单校验后保存，并自动重新索引数据源。
+
+层级接口和两个预览接口中的 `count`、`total` 均表示主图数据组数量，不包含伴随图。`branch-previews` 需要 `category`，`version-previews` 需要 `branch`，并都支持 `status_path`、`search` 和每组预览上限参数。
 
 ### 同步到标准目录
 
@@ -151,7 +156,7 @@ Content-Type: application/json
 }
 ```
 
-`dataset` 为空时同步全部数据集且只能增量写入；`overwrite=true` 必须指定单个数据集。同步以主图组为单位，把跨目录关联的主图、伴随图和 XML 汇总到标准版本目录。
+`dataset` 为空时同步全部数据集且只能增量写入；`overwrite=true` 必须指定单个数据集。同步以主图组为单位，把跨目录关联的主图、伴随图和 XML 汇总到标准版本目录。版本以下原目录被消除后若存在同名主图，服务端会按原相对路径生成稳定短标识，并让该组伴随图与 XML 共享新主干名，防止不同任务之间发生覆盖。响应同时返回 `groups`、`companions` 和 `renamed_groups` 等统计字段。
 
 ## 受管存储
 

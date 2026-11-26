@@ -59,11 +59,51 @@ class DataManagementTest(unittest.TestCase):
             self.assertEqual(updated.status_code, 200)
             self.assertGreaterEqual(updated.json()["updated"], 2)
 
+    def test_storage_sync_keeps_same_named_groups_distinct(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            source_root = workspace / "source"
+            for task, content in (("task-a", b"a"), ("task-b", b"b")):
+                image_dir = source_root / "geometry" / "matching" / "20261126" / task
+                image_dir.mkdir(parents=True)
+                (image_dir / "0.png").write_bytes(content)
+                (image_dir / "0_1.png").write_bytes(content + b"-icon")
+                (image_dir / "0.xml").write_text("<annotation />", encoding="utf-8")
+            managed = workspace / "managed"
+            repository = JsonRepository(workspace / "catalog.json")
+            repository.save_storage(StorageConfig(endpoint=str(managed)))
+
+            with patch.object(main, "repository", repository):
+                client = TestClient(main.app)
+                source_id = client.post("/api/data-sources", json={
+                    "name": "geometry source", "type": "local", "endpoint": str(source_root),
+                    "read_only": True, "options": {},
+                }).json()["id"]
+                client.post(f"/api/data-sources/{source_id}/scan")
+                datasets = client.get(f"/api/data-sources/{source_id}/datasets").json()["items"]
+                hierarchy = client.get(f"/api/data-sources/{source_id}/hierarchy").json()
+                branches = client.get(f"/api/data-sources/{source_id}/branch-previews", params={"category": "geometry"}).json()["items"]
+                versions = client.get(f"/api/data-sources/{source_id}/version-previews", params={"category": "geometry", "branch": "matching"}).json()["items"]
+                synced = client.post(f"/api/data-sources/{source_id}/storage-sync", json={})
+
+            target = managed / "geometry" / "matching" / "20261126"
+            self.assertEqual(datasets[0]["group_count"], 2)
+            self.assertEqual(datasets[0]["file_count"], 4)
+            self.assertEqual(hierarchy["categories"][0]["count"], 2)
+            self.assertEqual(hierarchy["categories"][0]["branches"][0]["versions"][0]["count"], 2)
+            self.assertEqual(branches[0]["total"], 2)
+            self.assertEqual(len(branches[0]["items"]), 2)
+            self.assertEqual(versions[0]["total"], 2)
+            self.assertEqual(synced.json()["groups"], 2)
+            self.assertEqual(synced.json()["renamed_groups"], 2)
+            self.assertEqual(len(list(target.glob("0__*.png"))), 4)
+            self.assertEqual(len(list(target.glob("0__*.xml"))), 2)
+
     def test_ai_hierarchy_mapping_is_shared_by_browser_and_sync(self):
         with tempfile.TemporaryDirectory() as directory:
             workspace = Path(directory)
             source_root = workspace / "mixed-source"
-            image_dir = source_root / "legacy-layout" / "large" / "batch-a"
+            image_dir = source_root / "geometry" / "matching" / "v1"
             image_dir.mkdir(parents=True)
             (image_dir / "sample.jpg").write_bytes(b"image")
             repository = JsonRepository(workspace / "catalog.json")
@@ -73,7 +113,7 @@ class DataManagementTest(unittest.TestCase):
                 "provider": "test",
                 "model": "test-model",
                 "mappings": [{
-                    "path_prefix": "legacy-layout/large/batch-a", "category": "geometry",
+                    "path_prefix": "geometry/matching/v1", "category": "geometry",
                     "branch": "matching", "version": "v1", "confidence": 0.96, "reason": "test",
                 }],
             }):
@@ -99,6 +139,62 @@ class DataManagementTest(unittest.TestCase):
             self.assertEqual(filtered["total"], 1)
             self.assertEqual(previews["items"][0]["version"], "v1")
             self.assertEqual(previews["items"][0]["total"], 1)
+
+    def test_provider_parent_is_not_used_as_dataset_category(self):
+        source = main.DataSource(
+            id="source-test",
+            name="visionengine_geometry",
+            type="local",
+            endpoint=str(Path("D:/datasets/visionengine/visionengine_geometry")),
+        )
+        mappings = main._respect_source_root_boundary(source, [{
+            "path_prefix": "please_click_the_matching_shape/20250821",
+            "category": "VisionEngine",
+            "branch": "Geometry",
+            "version": "20250821",
+            "confidence": 0.9,
+            "reason": "split source name",
+        }])
+
+        self.assertEqual(mappings[0]["category"], "geometry")
+        self.assertEqual(mappings[0]["branch"], "please_click_the_matching_shape")
+        self.assertEqual(mappings[0]["version"], "20250821")
+
+        normalized = main._respect_source_root_boundary(source, [{
+            "path_prefix": "please_click_the_matching_shape/20250821",
+            "category": "visionengine_geometry",
+            "branch": "please_click_the_matching_shape",
+            "version": "20250821",
+        }])
+        self.assertEqual(normalized[0]["category"], "geometry")
+        self.assertEqual(normalized[0]["branch"], "please_click_the_matching_shape")
+
+        parent_category = main._respect_source_root_boundary(source, [{
+            "path_prefix": "please_click_the_matching_shape/20250821",
+            "category": "VisionEngine",
+            "branch": "please_click_the_matching_shape",
+            "version": "20250821",
+        }])
+        self.assertEqual(parent_category[0]["category"], "geometry")
+        self.assertEqual(parent_category[0]["branch"], "please_click_the_matching_shape")
+
+    def test_ai_cannot_invent_category_or_missing_version_labels(self):
+        source = main.DataSource(
+            id="source-test",
+            name="drag_shapesimilar",
+            type="local",
+            endpoint=str(Path("D:/datasets/hc_drag/drag_shapesimilar")),
+        )
+        mappings = main._ground_hierarchy_to_source(source, [{
+            "path_prefix": "drag_the_block_shape_to_the_place_where_it_fits",
+            "category": "GUI",
+            "branch": "drag_the_block_shape_to_the_place_where_it_fits",
+            "version": "未标注",
+        }])
+
+        self.assertEqual(mappings[0]["category"], "drag_shapesimilar")
+        self.assertEqual(mappings[0]["branch"], "drag_the_block_shape_to_the_place_where_it_fits")
+        self.assertEqual(mappings[0]["version"], "unknown")
 
     def test_duplicate_local_source_reuses_existing_record(self):
         with tempfile.TemporaryDirectory() as directory:
