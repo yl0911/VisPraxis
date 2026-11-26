@@ -1231,6 +1231,8 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
   const [versionGroups, setVersionGroups] = useState<{ version: string; total: number; items: IndexedAsset[] }[]>([]);
   const [loading, setLoading] = useState(false);
   const [refreshSequence, setRefreshSequence] = useState(0);
+  const [previewLimit, setPreviewLimit] = useState(8);
+  const browserRef = useRef<HTMLElement>(null);
   const pageSize = 36;
   const contentUrl = (path: string) => `/api/storage/content?path=${encodeURIComponent(path)}`;
   const categoryInfo = hierarchy?.categories.find((item) => item.name === category);
@@ -1248,6 +1250,19 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
 
   useEffect(() => { refreshHierarchy(); }, [storagePath]);
   useEffect(() => {
+    const browser = browserRef.current;
+    if (!browser) return;
+    const updatePreviewLimit = () => {
+      const availableWidth = Math.max(168, browser.clientWidth - 328);
+      const columns = Math.max(1, Math.min(20, Math.floor((availableWidth + 10) / 178)));
+      setPreviewLimit(columns);
+    };
+    updatePreviewLimit();
+    const observer = new ResizeObserver(updatePreviewLimit);
+    observer.observe(browser);
+    return () => observer.disconnect();
+  }, []);
+  useEffect(() => {
     if (!category) {
       setDisplayAssets([]); setBranchGroups([]); setVersionGroups([]); setDisplayTotal(0);
       onSelect(""); setLoading(false);
@@ -1257,12 +1272,12 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
     setLoading(true);
     let url: string;
     if (category && !branch) {
-      const params = new URLSearchParams({ category, limit_per_branch: "8" });
+      const params = new URLSearchParams({ category, limit_per_branch: String(previewLimit) });
       if (search) params.set("search", search);
       if (strategy === "annotated") params.set("annotated_only", "true");
       url = `/api/storage/branch-previews?${params}`;
     } else if (branch && !version) {
-      const params = new URLSearchParams({ category, branch, limit_per_version: "8" });
+      const params = new URLSearchParams({ category, branch, limit_per_version: String(previewLimit) });
       if (search) params.set("search", search);
       if (strategy === "annotated") params.set("annotated_only", "true");
       url = `/api/storage/version-previews?${params}`;
@@ -1293,7 +1308,7 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
     }).catch((error) => { if (error.name !== "AbortError") setDisplayAssets([]); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
-  }, [category, branch, version, search, strategy, page, storagePath, refreshSequence]);
+  }, [category, branch, version, search, strategy, page, storagePath, refreshSequence, previewLimit]);
 
   const annotationColor = (label: string) => ["#e34f62", "#238bcb", "#dc8a16", "#6f55c7", "#1c9772"][Math.abs(Number.parseInt(label, 10) || 0) % 5];
   const annotationBoxes = (asset: IndexedAsset) => asset.xml?.image_width && asset.xml.image_height ? (asset.xml.objects || []).map((object) => ({
@@ -1311,7 +1326,7 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
     <strong>{asset.filename}</strong><small>{asset.companion_images.length} 张小图 · {asset.xml ? `${asset.xml.object_count} 个目标` : "未标注"}</small>
   </button>;
 
-  return <section className="managed-browser">
+  return <section className="managed-browser" ref={browserRef}>
     <header>
       <span><small>核心标准目录</small><h3>标准图像与标注文档</h3><p>{storagePath}</p></span>
       <div><em>{hierarchy?.group_count ?? total} 个数据组</em><em>{hierarchy?.annotation_count ?? annotationCount} 份 XML</em><button className="btn" onClick={async () => { onRefresh(); await refreshHierarchy(true); setRefreshSequence((value) => value + 1); }}><RefreshCw size={13} />刷新</button></div>
@@ -1330,8 +1345,8 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
     {!category ? <div className="managed-empty"><Archive size={22} /><b>先选择标准数据类型</b><span>未选择时不读取、不展示标准目录中的图像。</span></div> : !loading && !visibleAssets.length ? <div className="managed-empty"><Archive size={22} /><b>当前标准层级暂无图像</b><span>同步后的标准资产会按类型、分支和版本统一展示。</span></div> : <div className="managed-browser-body">
       <div className={(category && !branch) || (branch && !version) ? "managed-groups" : "managed-grid"}>
         {loading && <div className="browser-loading"><RefreshCw className="spin" />正在读取标准目录</div>}
-        {!loading && category && !branch && branchGroups.map((group) => <section className="managed-group" key={group.branch}><header><span><small>分支</small><b>{group.branch}</b><em>{group.total} 个数据组</em></span><button onClick={() => setBranch(group.branch)}>进入分支 <ChevronRight size={13} /></button></header><div className="managed-grid">{group.items.map(assetCard)}</div></section>)}
-        {!loading && branch && !version && versionGroups.map((group) => <section className="managed-group" key={group.version}><header><span><small>版本</small><b>{group.version}</b><em>{group.total} 个数据组</em></span><button onClick={() => setVersion(group.version)}>查看全部 <ChevronRight size={13} /></button></header><div className="managed-grid">{group.items.map(assetCard)}</div></section>)}
+        {!loading && category && !branch && branchGroups.map((group) => <section className="managed-group" key={group.branch}><header><span><small>分支</small><b>{group.branch}</b><em>{group.total} 个数据组 · 当前预览 {group.items.length} 组</em></span><button onClick={() => setBranch(group.branch)}>进入分支 <ChevronRight size={13} /></button></header><div className="managed-grid">{group.items.map(assetCard)}</div></section>)}
+        {!loading && branch && !version && versionGroups.map((group) => <section className="managed-group" key={group.version}><header><span><small>版本</small><b>{group.version}</b><em>{group.total} 个数据组 · 当前预览 {group.items.length} 组</em></span><button onClick={() => setVersion(group.version)}>查看全部 <ChevronRight size={13} /></button></header><div className="managed-grid">{group.items.map(assetCard)}</div></section>)}
         {!loading && version && displayAssets.map(assetCard)}
       </div>
       <aside>
@@ -1365,6 +1380,27 @@ function DatasetManagement() {
 }
 
 function ImageDataCenter({ page }: { page: number }) {
+  const visitedPages = useRef(new Set<number>());
+  visitedPages.current.add(page);
+  const persistentPages = [
+    DataManagement,
+    IndexedImageBrowser,
+    ImportExport,
+    DatasetManagement,
+    ManualAnnotation,
+    ToolLibrary,
+  ];
+
+  return <div className="data-center-pages">
+    {persistentPages.map((Page, index) => visitedPages.current.has(index) && (
+      <div className="data-center-tab-panel" hidden={page !== index} key={index}>
+        {index === 4 ? <ManualAnnotation active={page === 4} /> : <Page />}
+      </div>
+    ))}
+  </div>;
+}
+
+function LegacyImageDataCenter({ page }: { page: number }) {
   const [selected, setSelected] = useState(0);
   const samples = Array.from({ length: 8 }, (_, i) => ({
     id: i,
@@ -2086,7 +2122,7 @@ function DatasetInfo() {
   );
 }
 
-function ManualAnnotation() {
+function ManualAnnotation({ active = true }: { active?: boolean }) {
   type AnnotationRect = { id: string; label: number; x: number; y: number; width: number; height: number };
   const [index, setIndex] = useState(0);
   const [annotationAssets, setAnnotationAssets] = useState<IndexedAsset[]>([]);
@@ -2145,8 +2181,14 @@ function ManualAnnotation() {
   const classOptions = [0, 1];
 
   useEffect(() => {
-    Object.assign(managedDataViewSession, { category: annotationCategory, branch: annotationBranch, version: annotationVersion, selectedAssetId: currentAsset?.id || managedDataViewSession.selectedAssetId });
-  }, [annotationCategory, annotationBranch, annotationVersion, currentAsset?.id]);
+    if (!active) return;
+    const inherited = managedDataViewSession;
+    setAnnotationCategory(inherited.category);
+    setAnnotationBranch(inherited.branch);
+    setAnnotationVersion(inherited.version);
+    const inheritedIndex = annotationAssets.findIndex((asset) => asset.id === inherited.selectedAssetId);
+    if (inheritedIndex >= 0) setIndex(inheritedIndex);
+  }, [active]);
 
   useEffect(() => {
     fetch("/api/storage/hierarchy").then((response) => response.json()).then(setAnnotationHierarchy);

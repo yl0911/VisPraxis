@@ -182,7 +182,7 @@ Content-Type: application/json
 }
 ```
 
-标准目录首次访问会建立进程内扫描缓存，后续层级筛选和预览直接复用。数据同步、存储配置修改或 `refresh=true` 会使缓存失效。`assets`、`branch-previews` 和 `version-previews` 支持 `annotated_only=true`，用于“标注”展示策略在截取预览前过滤无 XML 数据组。
+标准目录首次访问会建立进程内扫描缓存，后续层级筛选和预览直接复用。数据同步、存储配置修改或 `refresh=true` 会使缓存失效。`assets`、`branch-previews` 和 `version-previews` 支持 `annotated_only=true`，用于“标注”展示策略在截取预览前过滤无 XML 数据组。两个预览接口分别接受 `limit_per_branch` 和 `limit_per_version`（1–20）；数据集页面根据内容区域宽度动态计算该值，使每个分支或版本正好展示一行固定尺寸卡片。
 
 ## 能力中心
 
