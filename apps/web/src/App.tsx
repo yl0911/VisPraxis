@@ -77,7 +77,7 @@ const nav = [
 ] as const;
 const subNav: Record<View, string[]> = {
   overview: ["运行总览", "图像巡检", "数据链路", "来源分析"],
-  preprocess: ["数据管理", "图像浏览", "人工标注", "工具集", "数据同步"],
+  preprocess: ["数据管理", "数据源", "数据同步", "数据集", "标注/编辑", "工具集"],
   solutions: ["方案库", "新数据评估", "提示词", "实验记录"],
   models: ["能力列表", "接入与适配", "版本与配置", "调度记录"],
   postprocess: ["结果资产", "人工复核", "收纳规则", "导出任务"],
@@ -662,10 +662,12 @@ function SystemSettings() {
 }
 
 function DataManagement() {
+  type StandardCategory = { name: string; count: number; branches: { name: string; count: number; versions: { name: string; count: number }[] }[] };
   const [addOpen, setAddOpen] = useState(false);
   const [sourceType, setSourceType] = useState<ManagedSource["type"]>("local");
   const [sources, setSources] = useState<ManagedSource[]>([]);
   const [storagePath, setStoragePath] = useState("D:\\VisPraxis\\managed-data");
+  const [standardCategories, setStandardCategories] = useState<StandardCategory[]>([]);
   const [searchSource, setSearchSource] = useState("");
   const [name, setName] = useState("");
   const [endpoint, setEndpoint] = useState("");
@@ -675,10 +677,6 @@ function DataManagement() {
   const [credentialProfile, setCredentialProfile] = useState("");
   const [busy, setBusy] = useState<string>();
   const [message, setMessage] = useState("");
-  const [managedAssets, setManagedAssets] = useState<IndexedAsset[]>([]);
-  const [managedTotal, setManagedTotal] = useState(0);
-  const [managedAnnotationCount, setManagedAnnotationCount] = useState(0);
-  const [managedSelectedId, setManagedSelectedId] = useState("");
   const [directoryOpen, setDirectoryOpen] = useState(false);
   const [directoryPath, setDirectoryPath] = useState("");
   const [directoryParent, setDirectoryParent] = useState<string | null>(null);
@@ -699,23 +697,17 @@ function DataManagement() {
   ) as Record<ManagedSource["type"], (typeof sourceTypes)[number]>;
 
   async function loadSources() {
-    const [sourceResponse, storageResponse, assetsResponse] = await Promise.all([
+    const [sourceResponse, storageResponse, hierarchyResponse] = await Promise.all([
       fetch("/api/data-sources"),
       fetch("/api/storage"),
-      fetch("/api/storage/assets?limit=24"),
+      fetch("/api/storage/hierarchy"),
     ]);
     if (sourceResponse.ok) setSources(await sourceResponse.json());
     if (storageResponse.ok) {
       const storage = (await storageResponse.json()) as { endpoint: string };
       setStoragePath(storage.endpoint);
     }
-    if (assetsResponse.ok) {
-      const result = await assetsResponse.json() as { items: IndexedAsset[]; total: number; annotation_count: number };
-      setManagedAssets(result.items);
-      setManagedTotal(result.total);
-      setManagedAnnotationCount(result.annotation_count);
-      setManagedSelectedId((current) => result.items.some((item) => item.id === current) ? current : result.items[0]?.id || "");
-    }
+    if (hierarchyResponse.ok) setStandardCategories((await hierarchyResponse.json()).categories || []);
   }
   useEffect(() => {
     loadSources().catch(() => setMessage("无法读取数据源，请检查 API 服务"));
@@ -890,8 +882,8 @@ function DataManagement() {
         <main className="source-registry">
           <header>
             <span>
-              <small>已接入来源</small>
-              <h3>数据源管理</h3>
+              <small>来源连接</small>
+              <h3>数据源</h3>
             </span>
             <div>
               <label>
@@ -988,15 +980,20 @@ function DataManagement() {
           </footer>
         </aside>
       </section>
-      <ManagedStorageBrowser
-        assets={managedAssets}
-        total={managedTotal}
-        annotationCount={managedAnnotationCount}
-        selectedId={managedSelectedId}
-        onSelect={setManagedSelectedId}
-        onRefresh={loadSources}
-        storagePath={storagePath}
-      />
+      <section className="source-registry dataset-registry">
+        <header><span><small>核心标准目录</small><h3>数据集</h3></span><div><button className="btn" onClick={() => loadSources()}><RefreshCw size={13} />刷新数据集</button></div></header>
+        {!standardCategories.length && <div className="source-empty"><Archive size={20} /><b>还没有标准数据集</b><span>完成数据同步后，将按类型、分支和版本在这里登记。</span></div>}
+        {standardCategories.map((item, index) => {
+          const versionCount = new Set(item.branches.flatMap((branch) => branch.versions.map((version) => version.name))).size;
+          return <article key={item.name}>
+            <i className={`registry-icon r${index % 5}`}><Archive size={17} /></i>
+            <span><strong>{item.name}</strong><small>{storagePath}\{item.name}</small><em>标准目录中的整合数据，不依赖原数据源记录</em></span>
+            <b>{item.branches.length} 个分支</b>
+            <div><i />{item.count.toLocaleString()} 组</div>
+            <div>{versionCount} 个版本</div>
+          </article>;
+        })}
+      </section>
       {addOpen && (
         <div className="import-backdrop" onMouseDown={() => setAddOpen(false)}>
           <section
@@ -1220,19 +1217,122 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
   onRefresh: () => void;
   storagePath: string;
 }) {
-  const selected = assets.find((asset) => asset.id === selectedId) || assets[0];
+  type StorageHierarchy = { image_count: number; group_count: number; annotation_count: number; categories: { name: string; count: number; branches: { name: string; count: number; versions: { name: string; count: number }[] }[] }[] };
+  const [hierarchy, setHierarchy] = useState<StorageHierarchy | null>(null);
+  const [category, setCategory] = useState("");
+  const [branch, setBranch] = useState("");
+  const [version, setVersion] = useState("");
+  const [search, setSearch] = useState("");
+  const [strategy, setStrategy] = useState<"primary" | "groups" | "annotated">("primary");
+  const [page, setPage] = useState(0);
+  const [displayAssets, setDisplayAssets] = useState(assets);
+  const [displayTotal, setDisplayTotal] = useState(total);
+  const [branchGroups, setBranchGroups] = useState<{ branch: string; total: number; items: IndexedAsset[] }[]>([]);
+  const [versionGroups, setVersionGroups] = useState<{ version: string; total: number; items: IndexedAsset[] }[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [refreshSequence, setRefreshSequence] = useState(0);
+  const pageSize = 36;
   const contentUrl = (path: string) => `/api/storage/content?path=${encodeURIComponent(path)}`;
+  const categoryInfo = hierarchy?.categories.find((item) => item.name === category);
+  const branchInfo = categoryInfo?.branches.find((item) => item.name === branch);
+  const visibleAssets = category && !branch ? branchGroups.flatMap((group) => group.items) : branch && !version ? versionGroups.flatMap((group) => group.items) : displayAssets;
+  const selected = visibleAssets.find((asset) => asset.id === selectedId) || visibleAssets[0];
+  useEffect(() => {
+    Object.assign(managedDataViewSession, { category, branch, version, selectedAssetId: selected?.id || "" });
+  }, [category, branch, version, selected?.id]);
+
+  async function refreshHierarchy(force = false) {
+    const response = await fetch(`/api/storage/hierarchy${force ? "?refresh=true" : ""}`);
+    if (response.ok) setHierarchy(await response.json());
+  }
+
+  useEffect(() => { refreshHierarchy(); }, [storagePath]);
+  useEffect(() => {
+    if (!category) {
+      setDisplayAssets([]); setBranchGroups([]); setVersionGroups([]); setDisplayTotal(0);
+      onSelect(""); setLoading(false);
+      return;
+    }
+    const controller = new AbortController();
+    setLoading(true);
+    let url: string;
+    if (category && !branch) {
+      const params = new URLSearchParams({ category, limit_per_branch: "8" });
+      if (search) params.set("search", search);
+      if (strategy === "annotated") params.set("annotated_only", "true");
+      url = `/api/storage/branch-previews?${params}`;
+    } else if (branch && !version) {
+      const params = new URLSearchParams({ category, branch, limit_per_version: "8" });
+      if (search) params.set("search", search);
+      if (strategy === "annotated") params.set("annotated_only", "true");
+      url = `/api/storage/version-previews?${params}`;
+    } else {
+      const params = new URLSearchParams({ skip: String(page * pageSize), limit: String(pageSize) });
+      if (category) params.set("category", category);
+      if (branch) params.set("branch", branch);
+      if (version) params.set("version", version);
+      if (search) params.set("search", search);
+      if (strategy === "annotated") params.set("annotated_only", "true");
+      url = `/api/storage/assets?${params}`;
+    }
+    fetch(url, { signal: controller.signal }).then((response) => response.json()).then((result) => {
+      if (category && !branch) {
+        setBranchGroups(result.items || []); setVersionGroups([]); setDisplayAssets([]);
+        setDisplayTotal((result.items || []).reduce((sum: number, group: { total: number }) => sum + group.total, 0));
+        const items = (result.items || []).flatMap((group: { items: IndexedAsset[] }) => group.items);
+        onSelect(items[0]?.id || "");
+      } else if (branch && !version) {
+        setVersionGroups(result.items || []); setBranchGroups([]); setDisplayAssets([]);
+        setDisplayTotal((result.items || []).reduce((sum: number, group: { total: number }) => sum + group.total, 0));
+        const items = (result.items || []).flatMap((group: { items: IndexedAsset[] }) => group.items);
+        onSelect(items[0]?.id || "");
+      } else {
+        setDisplayAssets(result.items || []); setDisplayTotal(result.total || 0); setBranchGroups([]); setVersionGroups([]);
+        onSelect((result.items || [])[0]?.id || "");
+      }
+    }).catch((error) => { if (error.name !== "AbortError") setDisplayAssets([]); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [category, branch, version, search, strategy, page, storagePath, refreshSequence]);
+
+  const annotationColor = (label: string) => ["#e34f62", "#238bcb", "#dc8a16", "#6f55c7", "#1c9772"][Math.abs(Number.parseInt(label, 10) || 0) % 5];
+  const annotationBoxes = (asset: IndexedAsset) => asset.xml?.image_width && asset.xml.image_height ? (asset.xml.objects || []).map((object) => ({
+    ...object,
+    left: (object.xmin / asset.xml!.image_width!) * 100,
+    top: (object.ymin / asset.xml!.image_height!) * 100,
+    width: ((object.xmax - object.xmin) / asset.xml!.image_width!) * 100,
+    height: ((object.ymax - object.ymin) / asset.xml!.image_height!) * 100,
+  })) : [];
+  const assetCard = (asset: IndexedAsset) => <button className={`${selected?.id === asset.id ? "selected" : ""} ${strategy === "groups" ? "group-card" : ""} ${strategy === "annotated" ? "annotated-card" : ""}`.trim()} onClick={() => onSelect(asset.id)} key={asset.id}>
+    <div className="asset-card-visual" style={strategy === "annotated" && asset.xml?.image_width && asset.xml.image_height ? { aspectRatio: `${asset.xml.image_width} / ${asset.xml.image_height}` } : undefined}>
+      {strategy === "groups" ? <div className="group-card-preview"><div className="group-primary"><img src={contentUrl(asset.relative_path)} loading="lazy" /><span>主图</span></div><div className="group-companions">{asset.companion_images.slice(0, 3).map((path, index) => <img src={contentUrl(path)} loading="lazy" alt={`关联小图 ${index + 1}`} key={path} />)}{!asset.companion_images.length && <small>无关联小图</small>}{asset.companion_images.length > 3 && <b>+{asset.companion_images.length - 3}</b>}</div></div> : <><img src={contentUrl(asset.relative_path)} loading="lazy" /><span>{strategy === "annotated" ? "标注预览" : "原图"}</span>{strategy === "annotated" && <div className="card-annotations">{annotationBoxes(asset).map((box) => <i className="card-annotation-box" style={{ left: `${box.left}%`, top: `${box.top}%`, width: `${box.width}%`, height: `${box.height}%`, borderColor: annotationColor(box.label), color: annotationColor(box.label) }} key={box.id}><b>{box.label}</b></i>)}</div>}</>}
+      {asset.xml && <em>{strategy === "annotated" ? `${asset.xml.object_count} 个目标` : "XML"}</em>}
+    </div>
+    <strong>{asset.filename}</strong><small>{asset.companion_images.length} 张小图 · {asset.xml ? `${asset.xml.object_count} 个目标` : "未标注"}</small>
+  </button>;
+
   return <section className="managed-browser">
     <header>
       <span><small>核心标准目录</small><h3>标准图像与标注文档</h3><p>{storagePath}</p></span>
-      <div><em>{total} 张图像</em><em>{annotationCount} 份 XML</em><button className="btn" onClick={onRefresh}><RefreshCw size={13} />刷新</button></div>
+      <div><em>{hierarchy?.group_count ?? total} 个数据组</em><em>{hierarchy?.annotation_count ?? annotationCount} 份 XML</em><button className="btn" onClick={async () => { onRefresh(); await refreshHierarchy(true); setRefreshSequence((value) => value + 1); }}><RefreshCw size={13} />刷新</button></div>
     </header>
-    {!assets.length ? <div className="managed-empty"><Archive size={22} /><b>标准目录暂无图像</b><span>导入或导出完成后，规范化资产会在这里统一浏览和继续加工。</span></div> : <div className="managed-browser-body">
-      <div className="managed-grid">
-        {assets.map((asset) => <button className={selected?.id === asset.id ? "selected" : ""} onClick={() => onSelect(asset.id)} key={asset.id}>
-          <div><img src={contentUrl(asset.relative_path)} loading="lazy" />{asset.xml && <em>XML</em>}</div>
-          <strong>{asset.filename}</strong><small>{asset.hierarchy.join(" / ") || "标准目录根级"}</small>
-        </button>)}
+    <div className="managed-toolbar">
+      <label><span>类型</span><SearchableSelect ariaLabel="标准目录类型" value={category} placeholder="全部类型" emptyLabel="全部类型" options={(hierarchy?.categories || []).map((item) => ({ value: item.name, label: `${item.name} (${item.count})` }))} onChange={(value) => { setCategory(value); setBranch(""); setVersion(""); setPage(0); }} /></label>
+      <label><span>分支</span><SearchableSelect ariaLabel="标准目录分支" value={branch} disabled={!category} placeholder={category ? "全部分支" : "请先选择类型"} emptyLabel="全部分支" options={(categoryInfo?.branches || []).map((item) => ({ value: item.name, label: `${item.name} (${item.count})` }))} onChange={(value) => { setBranch(value); setVersion(""); setPage(0); }} /></label>
+      <label><span>版本</span><SearchableSelect ariaLabel="标准目录版本" value={version} disabled={!branch} placeholder={branch ? "全部版本" : "请先选择分支"} emptyLabel="全部版本" options={(branchInfo?.versions || []).map((item) => ({ value: item.name, label: `${item.name} (${item.count})` }))} onChange={(value) => { setVersion(value); setPage(0); }} /></label>
+      <label className="managed-search"><span>搜索当前标准层级</span><div><Search size={13} /><input disabled={!category} value={search} onChange={(event) => { setSearch(event.target.value); setPage(0); }} placeholder={category ? "文件名或标准路径" : "请先选择类型"} /></div></label>
+    </div>
+    <section className="display-policy managed-display-policy">
+      <span><small>数据展示策略</small><b>原数据为主，关联信息随主图展示</b></span>
+      <div>{[["primary", "原图"], ["groups", "数据组"], ["annotated", "标注"]].map(([id, label]) => <button className={strategy === id ? "active" : ""} onClick={() => { setStrategy(id as typeof strategy); setPage(0); }} key={id}>{label}</button>)}</div>
+      <p>{strategy === "primary" && "仅按正常顺序浏览主图，关联信息保留在详情中。"}{strategy === "groups" && "以主图为一组，在卡片内组合展示关联小图。"}{strategy === "annotated" && "仅展示存在 XML 的主图，并直接叠加目标框与类别。"}</p>
+    </section>
+    {!category ? <div className="managed-empty"><Archive size={22} /><b>先选择标准数据类型</b><span>未选择时不读取、不展示标准目录中的图像。</span></div> : !loading && !visibleAssets.length ? <div className="managed-empty"><Archive size={22} /><b>当前标准层级暂无图像</b><span>同步后的标准资产会按类型、分支和版本统一展示。</span></div> : <div className="managed-browser-body">
+      <div className={(category && !branch) || (branch && !version) ? "managed-groups" : "managed-grid"}>
+        {loading && <div className="browser-loading"><RefreshCw className="spin" />正在读取标准目录</div>}
+        {!loading && category && !branch && branchGroups.map((group) => <section className="managed-group" key={group.branch}><header><span><small>分支</small><b>{group.branch}</b><em>{group.total} 个数据组</em></span><button onClick={() => setBranch(group.branch)}>进入分支 <ChevronRight size={13} /></button></header><div className="managed-grid">{group.items.map(assetCard)}</div></section>)}
+        {!loading && branch && !version && versionGroups.map((group) => <section className="managed-group" key={group.version}><header><span><small>版本</small><b>{group.version}</b><em>{group.total} 个数据组</em></span><button onClick={() => setVersion(group.version)}>查看全部 <ChevronRight size={13} /></button></header><div className="managed-grid">{group.items.map(assetCard)}</div></section>)}
+        {!loading && version && displayAssets.map(assetCard)}
       </div>
       <aside>
         {selected && <><div className="managed-preview"><img src={contentUrl(selected.relative_path)} /></div><h4>{selected.filename}</h4><dl>
@@ -1240,10 +1340,28 @@ function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onS
           <div><dt>分类层级</dt><dd>{selected.hierarchy.join(" / ") || "根级"}</dd></div>
           <div><dt>XML 标注</dt><dd>{selected.xml ? `${selected.xml.object_count} 个目标` : "暂无标注"}</dd></div>
           <div><dt>类别</dt><dd>{selected.xml ? Object.keys(selected.xml.classes).join("、") || "无目标" : "—"}</dd></div>
-        </dl><p><CircleCheck size={12} />资产按标准相对路径唯一管理，不依赖原数据源记录。</p></>}
+        </dl>{selected.companion_images.length > 0 && <div className="managed-companions"><b>关联小图 · {selected.companion_images.length}</b><div>{selected.companion_images.map((path) => <img src={contentUrl(path)} title={path} key={path} />)}</div></div>}<p><CircleCheck size={12} />资产按标准相对路径唯一管理，不依赖原数据源记录。</p></>}
       </aside>
     </div>}
+    {version && displayTotal > pageSize && <footer className="managed-pagination"><span>共 {displayTotal} 个标准数据组</span><div><button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}><ChevronLeft size={13} /></button><b>{page + 1}</b><button disabled={(page + 1) * pageSize >= displayTotal} onClick={() => setPage((value) => value + 1)}><ChevronRight size={13} /></button></div></footer>}
   </section>;
+}
+
+function DatasetManagement() {
+  const [storagePath, setStoragePath] = useState("D:\\VisPraxis\\managed-data");
+  const [selectedId, setSelectedId] = useState("");
+  async function loadStorage() {
+    const response = await fetch("/api/storage");
+    if (response.ok) setStoragePath((await response.json()).endpoint);
+  }
+  useEffect(() => { loadStorage(); }, []);
+  return <div className="stack dataset-management-page">
+    <section className="source-bar dataset-management-bar">
+      <div><i><Archive size={18} /></i><span><small>所有标准数据</small><strong>数据集管理</strong><code>{storagePath}</code></span></div>
+      <div className="source-stats"><span><b>类型</b><small>标准大类</small></span><span><b>分支</b><small>具体任务</small></span><span><b>版本</b><small>标准版本</small></span></div>
+    </section>
+    <ManagedStorageBrowser assets={[]} total={0} annotationCount={0} selectedId={selectedId} onSelect={setSelectedId} onRefresh={loadStorage} storagePath={storagePath} />
+  </div>;
 }
 
 function ImageDataCenter({ page }: { page: number }) {
@@ -1255,9 +1373,10 @@ function ImageDataCenter({ page }: { page: number }) {
     objects: i % 3 === 0 ? 2 : 3,
   }));
   if (page === 0) return <DataManagement />;
-  if (page === 2) return <ManualAnnotation />;
-  if (page === 3) return <ToolLibrary />;
-  if (page === 4) return <ImportExport />;
+  if (page === 2) return <ImportExport />;
+  if (page === 3) return <DatasetManagement />;
+  if (page === 4) return <ManualAnnotation />;
+  if (page === 5) return <ToolLibrary />;
   if (page === 1) return <IndexedImageBrowser />;
   const item = samples[selected];
   return (
@@ -1463,13 +1582,7 @@ const dataViewSession: DataViewSession = {
   page: 0,
 };
 
-const annotationViewSession = {
-  sourceId: "",
-  branch: "",
-  version: "",
-  statuses: [] as string[],
-  selectedAssetId: "",
-};
+const managedDataViewSession = { category: "", branch: "", version: "", selectedAssetId: "" };
 
 type SearchableSelectOption = {
   value: string;
@@ -1977,13 +2090,10 @@ function ManualAnnotation() {
   type AnnotationRect = { id: string; label: number; x: number; y: number; width: number; height: number };
   const [index, setIndex] = useState(0);
   const [annotationAssets, setAnnotationAssets] = useState<IndexedAsset[]>([]);
-  const [annotationSources, setAnnotationSources] = useState<ManagedSource[]>([]);
-  const inheritedBrowserSource = dataViewSession.sourceId;
-  const [annotationSourceId, setAnnotationSourceId] = useState(inheritedBrowserSource || annotationViewSession.sourceId);
-  const [annotationBranch, setAnnotationBranch] = useState(inheritedBrowserSource ? dataViewSession.branch : annotationViewSession.branch);
-  const [annotationVersion, setAnnotationVersion] = useState(inheritedBrowserSource ? dataViewSession.version : annotationViewSession.version);
-  const [annotationStatuses, setAnnotationStatuses] = useState<string[]>(inheritedBrowserSource ? [...dataViewSession.statuses] : [...annotationViewSession.statuses]);
-  const [annotationHierarchy, setAnnotationHierarchy] = useState<{ branches: { name: string; versions: { name: string }[] }[]; status_paths: string[] } | null>(null);
+  const [annotationCategory, setAnnotationCategory] = useState(managedDataViewSession.category);
+  const [annotationBranch, setAnnotationBranch] = useState(managedDataViewSession.branch);
+  const [annotationVersion, setAnnotationVersion] = useState(managedDataViewSession.version);
+  const [annotationHierarchy, setAnnotationHierarchy] = useState<{ categories: { name: string; branches: { name: string; versions: { name: string }[] }[] }[] } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [modelMode, setModelMode] = useState<"none" | "general" | "professional">("none");
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -2027,59 +2137,41 @@ function ManualAnnotation() {
     : modelMode === "general"
       ? "通用视觉检测模型"
       : "未配置模型";
-  const branchVersions = annotationHierarchy?.branches.find((item) => item.name === annotationBranch)?.versions || [];
+  const annotationCategoryInfo = annotationHierarchy?.categories.find((item) => item.name === annotationCategory);
+  const annotationBranches = annotationCategoryInfo?.branches || [];
+  const branchVersions = annotationBranches.find((item) => item.name === annotationBranch)?.versions || [];
   const labelColors = ["#36c979", "#f2a93b", "#3b9eea", "#e45c90", "#9b72e8", "#e16c45", "#42b7b0", "#d4c13b"];
   const boxColor = (label: number) => labelColors[Math.abs(label) % labelColors.length];
   const classOptions = [0, 1];
 
   useEffect(() => {
-    fetch("/api/data-sources")
-      .then((response) => response.json())
-      .then((sources: ManagedSource[]) => {
-        const indexed = sources.filter((item) => item.asset_count > 0);
-        setAnnotationSources(indexed);
-        if (annotationSourceId && !indexed.some((item) => item.id === annotationSourceId)) {
-          setAnnotationSourceId("");
-          setAnnotationBranch("");
-          setAnnotationVersion("");
-          setAnnotationStatuses([]);
-        }
-      });
+    Object.assign(managedDataViewSession, { category: annotationCategory, branch: annotationBranch, version: annotationVersion, selectedAssetId: currentAsset?.id || managedDataViewSession.selectedAssetId });
+  }, [annotationCategory, annotationBranch, annotationVersion, currentAsset?.id]);
+
+  useEffect(() => {
+    fetch("/api/storage/hierarchy").then((response) => response.json()).then(setAnnotationHierarchy);
   }, []);
 
   useEffect(() => {
-    Object.assign(annotationViewSession, {
-      sourceId: annotationSourceId,
-      branch: annotationBranch,
-      version: annotationVersion,
-      statuses: [...annotationStatuses],
-      selectedAssetId: currentAsset?.id || annotationViewSession.selectedAssetId,
-    });
-  }, [annotationSourceId, annotationBranch, annotationVersion, annotationStatuses, currentAsset?.id]);
-
-  useEffect(() => {
-    if (!annotationSourceId) { setAnnotationHierarchy(null); return; }
-    fetch(`/api/data-sources/${annotationSourceId}/hierarchy`).then((response) => response.json()).then(setAnnotationHierarchy);
-  }, [annotationSourceId]);
-
-  useEffect(() => {
-    if (!annotationSourceId) { setAnnotationAssets([]); setIndex(0); return; }
+    if (!annotationCategory) { setAnnotationAssets([]); setIndex(0); return; }
+    const controller = new AbortController();
     const params = new URLSearchParams({ limit: "200" });
+    params.set("category", annotationCategory);
     if (annotationBranch) params.set("branch", annotationBranch);
     if (annotationVersion) params.set("version", annotationVersion);
-    annotationStatuses.forEach((status) => params.append("status_path", status));
-    fetch(`/api/data-sources/${annotationSourceId}/assets?${params}`)
+    fetch(`/api/storage/assets?${params}`, { signal: controller.signal })
       .then((response) => response.json())
       .then((result: { items: IndexedAsset[] }) => {
-        const primaryAssets = result.items.filter((asset) => asset.role === "primary");
+        const primaryAssets = result.items;
         setAnnotationAssets(primaryAssets);
-        const inheritedAssetId = annotationViewSession.selectedAssetId || dataViewSession.selectedAssetId;
+        const inheritedAssetId = managedDataViewSession.selectedAssetId;
         const synchronizedIndex = primaryAssets.findIndex((asset) => asset.id === inheritedAssetId);
         setIndex(synchronizedIndex >= 0 ? synchronizedIndex : 0);
         setEditedBoxes({});
         setSavedSamples([]);
-      });
-  }, [annotationSourceId, annotationBranch, annotationVersion, annotationStatuses]);
+      }).catch((error) => { if (error.name !== "AbortError") setAnnotationAssets([]); });
+    return () => controller.abort();
+  }, [annotationCategory, annotationBranch, annotationVersion]);
 
   useEffect(() => {
     setSelectedBoxId("");
@@ -2196,7 +2288,7 @@ function ManualAnnotation() {
     setSaveState("saving");
     setSaveMessage("");
     try {
-      const response = await fetch(`/api/data-sources/${currentAsset.source_id}/assets/${currentAsset.id}/annotation`, {
+      const response = await fetch(`/api/storage/assets/${currentAsset.id}/annotation`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ image_width: dimensions.width, image_height: dimensions.height, objects: boxes.map((box) => ({ label: String(box.label), x: box.x, y: box.y, width: box.width, height: box.height })) }),
@@ -2214,15 +2306,15 @@ function ManualAnnotation() {
     }
   }
   return (
-    <div className={`annotation-page ${annotationSourceId ? "" : "unselected"}`.trim()}>
+    <div className={`annotation-page ${annotationCategory ? "" : "unselected"}`.trim()}>
       <section className="annotation-dataset-bar">
-        <label><span>类型 / 数据集</span><select value={annotationSourceId} onChange={(event) => { setAnnotationSourceId(event.target.value); setAnnotationBranch(""); setAnnotationVersion(""); setAnnotationStatuses([]); }}><option value="">请选择类型 / 数据集</option>{annotationSources.map((source) => <option value={source.id} key={source.id}>{source.name}</option>)}</select></label>
-        <label><span>分支</span><select value={annotationBranch} onChange={(event) => { setAnnotationBranch(event.target.value); setAnnotationVersion(""); }}><option value="">全部分支</option>{annotationHierarchy?.branches.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label>
+        <label><span>标准数据类型</span><select value={annotationCategory} onChange={(event) => { setAnnotationCategory(event.target.value); setAnnotationBranch(""); setAnnotationVersion(""); }}><option value="">请选择标准数据类型</option>{annotationHierarchy?.categories.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label>
+        <label><span>分支</span><select value={annotationBranch} disabled={!annotationCategory} onChange={(event) => { setAnnotationBranch(event.target.value); setAnnotationVersion(""); }}><option value="">全部分支</option>{annotationBranches.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label>
         <label><span>版本</span><select value={annotationVersion} disabled={!annotationBranch} onChange={(event) => setAnnotationVersion(event.target.value)}><option value="">全部版本</option>{branchVersions.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label>
-        <div className="annotation-statuses"><span>状态</span><div>{annotationHierarchy?.status_paths.map((status) => <label key={status}><input type="checkbox" checked={annotationStatuses.includes(status)} onChange={() => setAnnotationStatuses((current) => current.includes(status) ? current.filter((item) => item !== status) : [...current, status])} />{status}</label>)}{!annotationHierarchy?.status_paths.length && <small>未配置状态</small>}</div></div>
+        <div className="annotation-statuses"><span>数据范围</span><div><small>标准目录 · 类型 / 分支 / 版本</small></div></div>
         <div className="zoom-control"><span>画布缩放</span><div><button title="缩小" onClick={() => setZoom((value) => Math.max(0.5, value - 0.1))}><ZoomOut size={14} /></button><input type="range" min="50" max="200" value={Math.round(zoom * 100)} onChange={(event) => setZoom(Number(event.target.value) / 100)} /><b>{Math.round(zoom * 100)}%</b><button title="放大" onClick={() => setZoom((value) => Math.min(2, value + 0.1))}><ZoomIn size={14} /></button></div></div>
       </section>
-      <section className="annotation-unselected"><ImageIcon size={24} /><b>尚未选择标注内容</b><span>请先在图像浏览中选择数据，或在上方主动选择类型 / 数据集。</span></section>
+      <section className="annotation-unselected"><ImageIcon size={24} /><b>尚未选择标注内容</b><span>请先在数据集管理中选择标准数据，或在上方主动选择标准数据类型。</span></section>
       <section className="annotation-toolbar">
         <div>
           <button className="btn">
@@ -2302,13 +2394,14 @@ function ManualAnnotation() {
       <div className="annotation-workspace">
         <aside>
           <h3>样本队列</h3>
+          <small className="annotation-queue-scope">{[annotationCategory, annotationBranch, annotationVersion].filter(Boolean).join(" / ")}</small>
           {annotationAssets.map((asset, i) => (
             <button
               className={index === i ? "active" : ""}
               onClick={() => { if (boxes.length) setLastLabel(boxes[boxes.length - 1].label); setIndex(i); setSaveState("idle"); setSaveMessage(""); }}
-              key={i}
+              key={asset.id}
             >
-              <img src={`/api/data-sources/${asset.source_id}/assets/${asset.id}/content`} />
+              <img src={`/api/storage/content?path=${encodeURIComponent(asset.relative_path)}`} />
               <span>
                 <b>{asset.filename}</b>
                 <small>{asset.xml || savedSamples.includes(i) ? `XML · ${editedBoxes[i]?.length ?? asset.xml?.object_count ?? 0} 个目标` : (editedBoxes[i]?.length ? `编辑中 · ${editedBoxes[i].length} 个目标` : "未标注")}</small>
@@ -2327,7 +2420,7 @@ function ManualAnnotation() {
           <div className="annotation-canvas">
             <div className="annotation-primary">
               <div className="annotation-stage" ref={stageRef} style={{ transform: `scale(${zoom})` }} onPointerDown={beginDraw} onPointerMove={movePointer} onPointerUp={finishPointer}>
-                {currentAsset && <img src={`/api/data-sources/${currentAsset.source_id}/assets/${currentAsset.id}/content`} draggable={false} onLoad={(event) => { const assetId = currentAsset.id; const width = event.currentTarget.naturalWidth; const height = event.currentTarget.naturalHeight; setImageDimensions((current) => ({ ...current, [assetId]: { width, height } })); }} />}
+                {currentAsset && <img src={`/api/storage/content?path=${encodeURIComponent(currentAsset.relative_path)}`} draggable={false} onLoad={(event) => { const assetId = currentAsset.id; const width = event.currentTarget.naturalWidth; const height = event.currentTarget.naturalHeight; setImageDimensions((current) => ({ ...current, [assetId]: { width, height } })); }} />}
                 {boxes.filter((box) => !hiddenBoxIds.includes(box.id)).map((box) => <span className={`bbox ${selectedBoxId === box.id ? "selected" : ""}`} style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, height: `${box.height}%`, "--box-color": boxColor(box.label) } as React.CSSProperties} onPointerDown={(event) => beginMove(event, box)} key={box.id}><b>{box.label}</b>{selectedBoxId === box.id && <i className="resize-handle" onPointerDown={(event) => beginResize(event, box)} />}</span>)}
                 {draftBox && <span className="bbox draft" style={{ left: `${draftBox.x}%`, top: `${draftBox.y}%`, width: `${draftBox.width}%`, height: `${draftBox.height}%` }} />}
               </div>
@@ -2346,7 +2439,7 @@ function ManualAnnotation() {
               <header><span><small>数据组参考</small><b>关联小图</b></span><em>{currentAsset?.companion_images.length || 0}</em></header>
               {currentAsset?.companion_images.length ? <div>
                 {currentAsset.companion_images.map((path, referenceIndex) => <figure key={path}>
-                  <img src={`/api/data-sources/${currentAsset.source_id}/content?path=${encodeURIComponent(path)}`} alt={`关联参考 ${referenceIndex + 1}`} />
+                  <img src={`/api/storage/content?path=${encodeURIComponent(path)}`} alt={`关联参考 ${referenceIndex + 1}`} />
                   <figcaption><span>参考 {referenceIndex + 1}</span><small>{path.split(/[\\/]/).pop()}</small></figcaption>
                 </figure>)}
               </div> : <p>当前主图没有关联小图</p>}
@@ -2690,9 +2783,18 @@ function FavoriteTools() {
   const [published, setPublished] = useState<StoredCapability[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [pickerIds, setPickerIds] = useState<string[]>([]);
+  const [pickerType, setPickerType] = useState("");
+  const [pickerSearch, setPickerSearch] = useState("");
   const [message, setMessage] = useState("");
   const [loading, setLoading] = useState(true);
   const available = published.filter((item) => !tools.some((tool) => tool.id === item.id));
+  const pickerTypes = [...new Set(available.map((item) => item.type))].sort();
+  const normalizedPickerSearch = pickerSearch.trim().toLowerCase();
+  const filteredAvailable = available.filter((item) =>
+    (!pickerType || item.type === pickerType)
+    && (!normalizedPickerSearch || `${item.name} ${item.id} ${item.type} ${item.summary || ""} ${(item.categories || []).join(" ")}`.toLowerCase().includes(normalizedPickerSearch)),
+  );
+  const pickerGroups = (pickerType ? [pickerType] : pickerTypes).map((type) => ({ type, items: filteredAvailable.filter((item) => item.type === type) })).filter((group) => group.items.length);
   const iconFor = (type: string) => ({ 模型: WandSparkles, 算法: Boxes, 脚本: FileInput, 工具: Workflow, 服务: Server }[type] || Workflow);
   async function loadToolSet() {
     setLoading(true);
@@ -2731,6 +2833,10 @@ function FavoriteTools() {
     setPickerIds([]);
     setPicker(false);
   }
+  function togglePickerGroup(ids: string[]) {
+    const allSelected = ids.every((id) => pickerIds.includes(id));
+    setPickerIds((current) => allSelected ? current.filter((id) => !ids.includes(id)) : [...new Set([...current, ...ids])]);
+  }
   return (
     <div className="stack">
       <section className="tool-hero">
@@ -2741,7 +2847,7 @@ function FavoriteTools() {
             工具由流程或 llm_agent 选择调用；此处仅管理引用，删除不会影响能力中心内容。
           </p>
         </div>
-        <button className="btn primary" onClick={() => setPicker(true)}><Plus size={14} />从能力中心添加</button>
+        <button className="btn primary" onClick={() => { setPickerType(""); setPickerSearch(""); setPicker(true); }}><Plus size={14} />从能力中心添加</button>
       </section>
       {message && <div className="source-message"><CircleCheck size={13} />{message}</div>}
       <section className="favorite-note">
@@ -2789,13 +2895,21 @@ function FavoriteTools() {
             <span><small>能力中心</small><h2>添加到工具集</h2><p>选择能力引用到工具集，不复制或修改能力中心内容。</p></span>
             <button onClick={() => setPicker(false)}><X size={16} /></button>
           </header>
-          <div>
-            {available.map(({ id, name, type, summary }) => <article key={id}>
-              <input type="checkbox" checked={pickerIds.includes(id)} onChange={() => setPickerIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />
-              <span><b>{name}</b><small>{id} · {type}{summary ? ` · ${summary}` : ""}</small></span><em>已发布</em>
-            </article>)}
-            {!available.length && <div className="directory-empty">能力中心中的可用工具已全部加入</div>}
+          <div className="cap-picker-filters">
+            <label><span>分类</span><select value={pickerType} onChange={(event) => setPickerType(event.target.value)}><option value="">全部分类 ({available.length})</option>{pickerTypes.map((type) => <option value={type} key={type}>{type} ({available.filter((item) => item.type === type).length})</option>)}</select></label>
+            <label><span>检索</span><div><Search size={13} /><input value={pickerSearch} onChange={(event) => setPickerSearch(event.target.value)} placeholder="名称、ID、说明或标签" /></div></label>
           </div>
+          <section className="cap-picker-list">
+            {pickerGroups.map((group) => { const ids = group.items.map((item) => item.id); const allSelected = ids.every((id) => pickerIds.includes(id)); return <section className="cap-picker-group" key={group.type}>
+              <header><label><input type="checkbox" checked={allSelected} ref={(input) => { if (input) input.indeterminate = !allSelected && ids.some((id) => pickerIds.includes(id)); }} onChange={() => togglePickerGroup(ids)} /><b>{group.type}</b><em>{group.items.length}</em></label></header>
+              {group.items.map(({ id, name, type, summary }) => <article key={id}>
+                <input type="checkbox" checked={pickerIds.includes(id)} onChange={() => setPickerIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />
+                <span><b>{name}</b><small>{id} · {type}{summary ? ` · ${summary}` : ""}</small></span><em>已发布</em>
+              </article>)}
+            </section>; })}
+            {!available.length && <div className="directory-empty">能力中心中的可用工具已全部加入</div>}
+            {!!available.length && !filteredAvailable.length && <div className="directory-empty">没有匹配的已发布能力</div>}
+          </section>
           <footer>
             <button className="btn" onClick={() => setPicker(false)}>取消</button>
             <button className="btn primary" disabled={!pickerIds.length} onClick={addPicked}>添加所选 ({pickerIds.length})</button>

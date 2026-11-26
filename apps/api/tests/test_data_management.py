@@ -238,7 +238,17 @@ class DataManagementTest(unittest.TestCase):
             repository.save_storage(StorageConfig(endpoint=str(managed)))
 
             with patch.object(main, "repository", repository):
-                response = TestClient(main.app).get("/api/storage/assets")
+                client = TestClient(main.app)
+                response = client.get("/api/storage/assets")
+                hierarchy = client.get("/api/storage/hierarchy").json()
+                branches = client.get("/api/storage/branch-previews", params={"category": "geometry"}).json()["items"]
+                versions = client.get("/api/storage/version-previews", params={"category": "geometry", "branch": "matching"}).json()["items"]
+                annotated = client.get("/api/storage/assets", params={"category": "geometry", "annotated_only": True}).json()
+                asset_id = response.json()["items"][0]["id"]
+                saved = client.post(f"/api/storage/assets/{asset_id}/annotation", json={
+                    "image_width": 120, "image_height": 80,
+                    "objects": [{"label": "updated", "x": 10, "y": 10, "width": 20, "height": 30}],
+                })
 
             self.assertEqual(response.status_code, 200)
             body = response.json()
@@ -246,6 +256,13 @@ class DataManagementTest(unittest.TestCase):
             self.assertEqual(body["annotation_count"], 1)
             self.assertEqual(body["items"][0]["relative_path"], "geometry/matching/20261126/sample.jpg")
             self.assertEqual(body["items"][0]["xml"]["classes"], {"shape": 1})
+            self.assertEqual(hierarchy["categories"][0]["name"], "geometry")
+            self.assertEqual(hierarchy["categories"][0]["branches"][0]["versions"][0]["count"], 1)
+            self.assertEqual(branches[0]["total"], 1)
+            self.assertEqual(versions[0]["total"], 1)
+            self.assertEqual(annotated["total"], 1)
+            self.assertEqual(saved.status_code, 200)
+            self.assertIn("<name>updated</name>", (version / "sample.xml").read_text(encoding="utf-8"))
             self.assertEqual(repository.list_sources(), [])
 
 

@@ -105,7 +105,7 @@ XML 输出位置为：
 {原图所在目录}/{原图文件名，扩展名替换为 .xml}
 ```
 
-人工标注直接维护数据源中的配套 XML。受管存储不参与此保存流程；数据同步负责按图像组复制和整合图像与标注文档，并按“类型 / 分支 / 版本”组织标准数据。
+该接口保留直接维护数据源配套 XML 的能力。当前产品中的“标注/编辑”主流程使用核心标准目录接口，在完成数据同步后维护标准图像旁的 XML。
 
 ## 层级配置
 
@@ -164,8 +164,12 @@ Content-Type: application/json
 | --- | --- | --- |
 | `GET` | `/api/storage` | 获取标准数据存储配置 |
 | `PUT` | `/api/storage` | 修改导入导出及处理产出的标准数据存储配置 |
-| `GET` | `/api/storage/assets` | 扫描并分页浏览标准目录中的图像与配套 XML |
+| `GET` | `/api/storage/hierarchy` | 获取全部标准数据的类型、分支、版本和数据组统计；`refresh=true` 强制重扫 |
+| `GET` | `/api/storage/assets` | 按类型、分支、版本、检索词和标注状态分页浏览标准数据组 |
+| `GET` | `/api/storage/branch-previews` | 获取指定标准类型下的分支分块预览 |
+| `GET` | `/api/storage/version-previews` | 获取指定标准分支下的版本分块预览 |
 | `GET` | `/api/storage/content?path=...` | 按标准目录相对路径读取图像 |
+| `POST` | `/api/storage/assets/{asset_id}/annotation` | 在标准图像旁保存同名 Pascal VOC XML |
 
 ```http
 PUT /api/storage
@@ -177,6 +181,8 @@ Content-Type: application/json
   "hierarchy_template": "{category}/{branch}/{version}"
 }
 ```
+
+标准目录首次访问会建立进程内扫描缓存，后续层级筛选和预览直接复用。数据同步、存储配置修改或 `refresh=true` 会使缓存失效。`assets`、`branch-previews` 和 `version-previews` 支持 `annotated_only=true`，用于“标注”展示策略在截取预览前过滤无 XML 数据组。
 
 ## 能力中心
 
@@ -199,6 +205,8 @@ Content-Type: application/json
 - `published`：已发布，可供其他模块选择。
 - `disabled`：已停用。
 - `deleted`：软删除，可恢复到其他状态。
+
+工具集的“从能力中心添加”界面只列出未引用的已发布能力，支持按能力类型分类、按名称/ID/说明/标签检索，以及分类全选和跨分类批量添加。
 
 ### 分析来源
 

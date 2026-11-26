@@ -6,6 +6,7 @@ import string
 import re
 import shutil
 import hashlib
+import threading
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
@@ -64,6 +65,14 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_managed_storage_cache: dict[str, object] = {"root": "", "created_at": 0.0, "assets": [], "image_count": 0}
+_managed_storage_cache_lock = threading.Lock()
+
+
+def _invalidate_managed_storage_cache() -> None:
+    with _managed_storage_cache_lock:
+        _managed_storage_cache.update({"root": "", "created_at": 0.0, "assets": [], "image_count": 0})
 
 
 @app.get("/api/capabilities")
@@ -686,6 +695,7 @@ def synchronize_to_storage(source_id: str, payload: StorageSyncRequest):
                     annotations += 1
     if selected and not datasets:
         raise HTTPException(status_code=404, detail="所选数据集不存在或尚未建立索引")
+    _invalidate_managed_storage_cache()
     return {
         "source_id": source.id,
         "dataset_count": len(datasets),
@@ -738,6 +748,12 @@ def save_asset_annotation(source_id: str, asset_id: str, payload: AnnotationSave
     if not asset:
         raise HTTPException(status_code=404, detail="图像资产不存在")
     root = Path(source.endpoint).expanduser().resolve()
+    result = _write_asset_annotation(root, asset, payload)
+    repository.save_asset(asset)
+    return result
+
+
+def _write_asset_annotation(root: Path, asset, payload: AnnotationSaveRequest):
     image_path = (root / asset.relative_path).resolve()
     target = image_path.with_suffix(".xml")
     if not target.is_relative_to(root):
@@ -771,8 +787,17 @@ def save_asset_annotation(source_id: str, asset_id: str, payload: AnnotationSave
 
     classes = Counter(item.label for item in payload.objects)
     asset.xml = XmlSummary(path=target.relative_to(root).as_posix(), object_count=len(payload.objects), classes=dict(classes), image_width=payload.image_width, image_height=payload.image_height, objects=parsed_objects)
-    repository.save_asset(asset)
     return {"ok": True, "path": str(target), "object_count": len(payload.objects)}
+
+
+@app.post("/api/storage/assets/{asset_id}/annotation")
+def save_storage_asset_annotation(asset_id: str, payload: AnnotationSaveRequest):
+    root, assets, _ = _managed_storage_assets()
+    asset = next((item for item in assets if item.id == asset_id), None)
+    if not asset:
+        raise HTTPException(status_code=404, detail="标准目录图像不存在或已移动")
+    result = _write_asset_annotation(root, asset, payload)
+    return result
 
 
 @app.get("/api/storage", response_model=StorageConfig)
@@ -780,25 +805,112 @@ def get_storage() -> StorageConfig:
     return repository.get_storage()
 
 
-@app.get("/api/storage/assets")
-def storage_assets(skip: int = Query(default=0, ge=0), limit: int = Query(default=48, ge=1, le=200), search: str | None = None):
+def _managed_storage_assets(force: bool = False):
     storage = repository.get_storage()
     if storage.type != "local":
         raise HTTPException(status_code=501, detail="当前仅支持浏览本地标准目录")
     root = Path(storage.endpoint).expanduser().resolve()
     if not root.is_dir():
-        return {"items": [], "total": 0, "image_count": 0, "annotation_count": 0}
-    result = scan_local_source("managed-storage", str(root), include_assets=True)
-    assets = [asset for asset in result.assets if asset.role == "primary"]
+        return root, [], 0
+    cache_key = str(root).casefold()
+    with _managed_storage_cache_lock:
+        if not force and _managed_storage_cache["root"] == cache_key:
+            return root, _managed_storage_cache["assets"], int(_managed_storage_cache["image_count"])
+        result = scan_local_source("managed-storage", str(root), include_assets=True)
+        assets = [asset for asset in result.assets if asset.role == "primary"]
+        _managed_storage_cache.update({
+            "root": cache_key, "created_at": time.monotonic(), "assets": assets, "image_count": result.image_count,
+        })
+        return root, assets, result.image_count
+
+
+def _managed_dataset(asset) -> tuple[str, str, str] | None:
+    return tuple(asset.hierarchy[:3]) if len(asset.hierarchy) >= 3 else None
+
+
+@app.get("/api/storage/hierarchy")
+def storage_hierarchy(refresh: bool = False):
+    _, assets, image_count = _managed_storage_assets(force=refresh)
+    categories: dict[str, dict[str, dict[str, int]]] = {}
+    for asset in assets:
+        dataset = _managed_dataset(asset)
+        if not dataset:
+            continue
+        category, branch, version = dataset
+        versions = categories.setdefault(category, {}).setdefault(branch, {})
+        versions[version] = versions.get(version, 0) + 1
+    return {
+        "image_count": image_count,
+        "group_count": len(assets),
+        "annotation_count": sum(1 for asset in assets if asset.xml),
+        "categories": [
+            {"name": category, "count": sum(sum(versions.values()) for versions in branches.values()), "branches": [
+                {"name": branch, "count": sum(versions.values()), "versions": [
+                    {"name": version, "count": count} for version, count in sorted(versions.items(), reverse=True)
+                ]} for branch, versions in sorted(branches.items())
+            ]} for category, branches in sorted(categories.items())
+        ],
+    }
+
+
+@app.get("/api/storage/assets")
+def storage_assets(
+    skip: int = Query(default=0, ge=0), limit: int = Query(default=48, ge=1, le=200),
+    category: str | None = None, branch: str | None = None, version: str | None = None,
+    search: str | None = None, annotated_only: bool = False,
+):
+    _, assets, image_count = _managed_storage_assets()
+    assets = [asset for asset in assets if (
+        (dataset := _managed_dataset(asset))
+        and (not category or dataset[0] == category)
+        and (not branch or dataset[1] == branch)
+        and (not version or dataset[2] == version)
+    )]
+    if annotated_only:
+        assets = [asset for asset in assets if asset.xml]
     if search:
         needle = search.lower()
         assets = [asset for asset in assets if needle in asset.filename.lower() or needle in asset.relative_path.lower()]
     return {
         "items": assets[skip : skip + limit],
         "total": len(assets),
-        "image_count": result.image_count,
+        "image_count": image_count,
         "annotation_count": sum(1 for asset in assets if asset.xml),
     }
+
+
+@app.get("/api/storage/branch-previews")
+def storage_branch_previews(category: str = Query(min_length=1), search: str | None = None, annotated_only: bool = False, limit_per_branch: int = Query(default=8, ge=1, le=20)):
+    _, assets, _ = _managed_storage_assets()
+    grouped: dict[str, dict] = {}
+    for asset in assets:
+        dataset = _managed_dataset(asset)
+        if not dataset or dataset[0] != category or (search and search.lower() not in asset.relative_path.lower()):
+            continue
+        if annotated_only and not asset.xml:
+            continue
+        group = grouped.setdefault(dataset[1], {"branch": dataset[1], "total": 0, "items": []})
+        group["total"] += 1
+        if len(group["items"]) < limit_per_branch:
+            group["items"].append(asset)
+    return {"items": [grouped[key] for key in sorted(grouped, key=str.casefold)]}
+
+
+@app.get("/api/storage/version-previews")
+def storage_version_previews(category: str = Query(min_length=1), branch: str = Query(min_length=1), search: str | None = None, annotated_only: bool = False, limit_per_version: int = Query(default=8, ge=1, le=20)):
+    _, assets, _ = _managed_storage_assets()
+    grouped: dict[str, dict] = {}
+    for asset in assets:
+        dataset = _managed_dataset(asset)
+        if not dataset or dataset[:2] != (category, branch) or (search and search.lower() not in asset.relative_path.lower()):
+            continue
+        if annotated_only and not asset.xml:
+            continue
+        group = grouped.setdefault(dataset[2], {"version": dataset[2], "total": 0, "items": []})
+        group["total"] += 1
+        if len(group["items"]) < limit_per_version:
+            group["items"].append(asset)
+    return {"items": [grouped[key] for key in sorted(grouped, reverse=True)]}
 
 
 @app.get("/api/storage/content")
@@ -822,7 +934,9 @@ def update_storage(payload: StorageConfig) -> StorageConfig:
         if not endpoint.is_dir():
             raise HTTPException(status_code=422, detail="标准数据存储位置不可用")
     payload.updated_at = utc_now()
-    return repository.save_storage(payload)
+    saved = repository.save_storage(payload)
+    _invalidate_managed_storage_cache()
+    return saved
 
 
 DEMO_IMAGES = [
