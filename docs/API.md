@@ -23,9 +23,13 @@ VisPraxis API 基于 FastAPI，开发环境默认监听 `http://127.0.0.1:4101`�
 | `GET` | `/api/data-sources/{source_id}/assets` | 分页查询图像资产 |
 | `GET` | `/api/data-sources/{source_id}/hierarchy` | 获取分支、版本和路径候选 |
 | `PUT` | `/api/data-sources/{source_id}/hierarchy-config` | 保存层级示例和状态路径 |
+| `POST` | `/api/data-sources/{source_id}/hierarchy/analyze` | 使用 LLM 分析层级和数据组匹配规则，并重新索引 |
+| `GET` | `/api/data-sources/{source_id}/datasets` | 获取已识别的标准数据集 |
+| `GET` | `/api/data-sources/{source_id}/version-previews` | 单次获取分支下各版本的预览资产 |
+| `POST` | `/api/data-sources/{source_id}/storage-sync` | 按数据组同步到标准目录 |
 | `GET` | `/api/data-sources/{source_id}/content` | 按相对路径读取本地图像 |
 | `GET` | `/api/data-sources/{source_id}/assets/{asset_id}/content` | 读取指定资产图像 |
-| `POST` | `/api/data-sources/{source_id}/assets/{asset_id}/annotation` | 保存 VOC XML 标注到受管存储 |
+| `POST` | `/api/data-sources/{source_id}/assets/{asset_id}/annotation` | 在原图同目录保存同名 VOC XML 标注 |
 
 兼容别名 `/api/sources` 仍然存在，但新代码应使用 `/api/data-sources`。
 
@@ -53,7 +57,7 @@ Content-Type: application/json
 POST /api/data-sources/{source_id}/scan?include_assets=false
 ```
 
-扫描器会递归处理常见图片格式和同名 `.xml` 文件，生成稳定的资产 ID、层级、主图/伴随图关系及 XML 摘要。每次扫描会替换该来源已有索引，但不会修改源文件。
+扫描器会递归处理常见图片格式和 `.xml` 文件，生成稳定的资产 ID、层级、主图/伴随图关系及 XML 摘要。主图、`icon/bg` 等伴随图和 XML 可以位于同一版本的不同内容目录。每次扫描会替换该来源已有索引，但不会修改源文件。
 
 ### 查询资产
 
@@ -65,6 +69,7 @@ GET /api/data-sources/{source_id}/assets?skip=0&limit=50&branch=branch_name&vers
 | --- | --- |
 | `skip` | 起始偏移，默认 `0` |
 | `limit` | 每页数量，范围 `1-200`，默认 `50` |
+| `category` | 类型筛选 |
 | `branch` | 分支筛选 |
 | `version` | 版本筛选 |
 | `status_path` | 可重复传递的状态路径筛选 |
@@ -96,8 +101,10 @@ Content-Type: application/json
 XML 输出位置为：
 
 ```text
-{受管存储目录}/{数据源名称}/{原图相对路径，扩展名替换为 .xml}
+{原图所在目录}/{原图文件名，扩展名替换为 .xml}
 ```
+
+人工标注直接维护数据源中的配套 XML。受管存储不参与此保存流程；数据同步负责按图像组复制和整合图像与标注文档，并按“类型 / 分支 / 版本”组织标准数据。
 
 ## 层级配置
 
@@ -118,12 +125,42 @@ Content-Type: application/json
 
 示例路径用于统一解释原始目录，不会移动或重命名源文件。未被选为类型、分支、版本或状态的中间路径按冗余目录处理。
 
+### AI 层级与组合规则分析
+
+`POST /api/data-sources/{source_id}/hierarchy/analyze` 会在本地先归并目录和文件名模式，再调用已配置的 OpenAI-compatible LLM：
+
+- 同一目录即使包含大量图像，也只形成一条“目录 + 图像数量”摘要。
+- 最多发送 120 条代表目录和 60 条文件名样本。
+- 不发送图像、XML 内容或文件二进制。
+- 返回类型、分支、版本映射，以及内容目录角色和伴随图后缀规则。
+- 规则经过白名单校验后保存，并自动重新索引数据源。
+
+### 同步到标准目录
+
+```http
+POST /api/data-sources/{source_id}/storage-sync
+Content-Type: application/json
+
+{
+  "dataset": {
+    "category": "drag",
+    "branch": "complement",
+    "version": "20251013"
+  },
+  "overwrite": false
+}
+```
+
+`dataset` 为空时同步全部数据集且只能增量写入；`overwrite=true` 必须指定单个数据集。同步以主图组为单位，把跨目录关联的主图、伴随图和 XML 汇总到标准版本目录。
+
 ## 受管存储
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `GET` | `/api/storage` | 获取标准数据存储配置 |
-| `PUT` | `/api/storage` | 修改存储配置；当前仅本地目录可用于保存标注 |
+| `PUT` | `/api/storage` | 修改导入导出及处理产出的标准数据存储配置 |
+| `GET` | `/api/storage/assets` | 扫描并分页浏览标准目录中的图像与配套 XML |
+| `GET` | `/api/storage/content?path=...` | 按标准目录相对路径读取图像 |
 
 ```http
 PUT /api/storage
@@ -144,6 +181,10 @@ Content-Type: application/json
 | `GET` | `/api/capabilities/taxonomy` | 获取能力类型与推荐分类词表 |
 | `POST` | `/api/capabilities/analyze` | 扫描来源并使用可选 LLM 分析能力 |
 | `POST` | `/api/capabilities/import` | 将分析结果保存为未审核能力 |
+| `PATCH` | `/api/capabilities/status` | 原子批量更新能力状态 |
+| `GET` | `/api/tool-set` | 获取工具集中的能力引用与实时能力卡片 |
+| `POST` | `/api/tool-set` | 将已发布能力批量加入工具集 |
+| `DELETE` | `/api/tool-set` | 批量移除工具集引用，不修改能力中心 |
 | `PATCH` | `/api/capabilities/{capability_id}` | 修改能力字段或状态 |
 | `DELETE` | `/api/capabilities/{capability_id}` | 软删除能力，将状态改为 `deleted` |
 

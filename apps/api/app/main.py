@@ -4,6 +4,7 @@ import time
 import os
 import string
 import re
+import shutil
 import xml.etree.ElementTree as ET
 from collections import Counter
 from datetime import datetime, timezone
@@ -20,12 +21,19 @@ from .capability_service import (
     CapabilityAnalyzeRequest,
     CapabilityImportRequest,
     CapabilityUpdate,
+    CapabilityBatchStatusUpdate,
+    ToolSetUpdate,
     analyze_capability_source,
+    analyze_data_hierarchy,
     get_ai_settings,
     get_capability_taxonomy,
     import_capabilities,
     list_capabilities,
+    list_tool_set,
+    add_tool_set_capabilities,
+    remove_tool_set_capabilities,
     update_capability,
+    update_capability_status_batch,
     delete_capability,
     save_ai_settings,
     test_ai_connection,
@@ -41,6 +49,7 @@ from .models import (
     SourceStatus,
     SourceType,
     StorageConfig,
+    StorageSyncRequest,
     utc_now,
 )
 from .repository import Repository, create_repository
@@ -97,6 +106,14 @@ def create_capabilities(payload: CapabilityImportRequest):
     return import_capabilities(payload)
 
 
+@app.patch("/api/capabilities/status")
+def patch_capability_status_batch(payload: CapabilityBatchStatusUpdate):
+    try:
+        return update_capability_status_batch(payload.capability_ids, payload.status)
+    except ValueError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
+
+
 @app.patch("/api/capabilities/{capability_id}")
 def patch_capability(capability_id: str, payload: CapabilityUpdate):
     record = update_capability(capability_id, payload.model_dump(exclude_unset=True))
@@ -110,6 +127,24 @@ def remove_capability(capability_id: str):
     if not delete_capability(capability_id):
         raise HTTPException(status_code=404, detail="能力不存在")
     return Response(status_code=204)
+
+
+@app.get("/api/tool-set")
+def tool_set_catalog():
+    return {"items": list_tool_set()}
+
+
+@app.post("/api/tool-set")
+def add_tool_set_items(payload: ToolSetUpdate):
+    try:
+        return add_tool_set_capabilities(payload.capability_ids)
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+
+
+@app.delete("/api/tool-set")
+def remove_tool_set_items(payload: ToolSetUpdate):
+    return remove_tool_set_capabilities(payload.capability_ids)
 repository: Repository = create_repository()
 
 
@@ -162,9 +197,42 @@ def list_sources() -> list[DataSource]:
     return repository.list_sources()
 
 
+def _source_identity(source_type: SourceType, endpoint: str, options: dict) -> tuple[str, str, str, str]:
+    if source_type == SourceType.LOCAL:
+        normalized_endpoint = os.path.normcase(str(Path(endpoint).expanduser().resolve()))
+    else:
+        normalized_endpoint = endpoint.strip().rstrip("/").lower()
+    return (
+        source_type.value,
+        normalized_endpoint,
+        str(options.get("bucket", "")).strip().lower(),
+        str(options.get("prefix", "")).replace("\\", "/").strip("/"),
+    )
+
+
 @app.post("/api/data-sources", response_model=DataSource, status_code=status.HTTP_201_CREATED)
 def create_source(payload: DataSourceCreate) -> DataSource:
     now = utc_now()
+    identity = _source_identity(payload.type, payload.endpoint, payload.options)
+    existing = next(
+        (
+            item
+            for item in repository.list_sources()
+            if _source_identity(item.type, item.endpoint, item.options) == identity
+        ),
+        None,
+    )
+    if existing:
+        updated = existing.model_copy(
+            update={
+                "name": payload.name,
+                "endpoint": payload.endpoint,
+                "description": payload.description,
+                "options": {**existing.options, **payload.options},
+                "updated_at": now,
+            }
+        )
+        return repository.save_source(updated)
     source = DataSource(
         **payload.model_dump(),
         id=f"source-{uuid4().hex[:12]}",
@@ -214,7 +282,7 @@ def _synchronize_source(source_id: str, include_assets: bool = False):
             detail=f"{source.type.value} 已完成注册，但{action}适配器尚未启用",
         )
     try:
-        result = scan_local_source(source.id, source.endpoint, include_assets=True)
+        result = scan_local_source(source.id, source.endpoint, include_assets=True, association_rules=source.options.get("association_rules"))
     except (FileNotFoundError, PermissionError) as error:
         source.status = SourceStatus.OFFLINE
         source.updated_at = utc_now()
@@ -243,18 +311,55 @@ def synchronize_source(source_id: str, include_assets: bool = Query(default=Fals
     return _synchronize_source(source_id, include_assets)
 
 
+@app.get("/api/data-sources/{source_id}/version-previews")
+def version_previews(
+    source_id: str,
+    branch: str = Query(min_length=1),
+    category: str | None = None,
+    status_path: list[str] = Query(default=[]),
+    search: str | None = None,
+    limit_per_version: int = Query(default=10, ge=1, le=20),
+):
+    source = _source_or_404(source_id)
+    candidates, _ = repository.list_assets(source_id, 0, 10_000_000, None, None, status_path, search)
+    grouped: dict[str, dict] = {}
+    for asset in candidates:
+        dataset = _asset_dataset(source, asset.hierarchy)
+        if not dataset or dataset[1] != branch or (category and dataset[0] != category):
+            continue
+        version = dataset[2]
+        group = grouped.setdefault(version, {"version": version, "total": 0, "items": []})
+        group["total"] += 1
+        if len(group["items"]) < limit_per_version:
+            group["items"].append(asset)
+    return {"items": [grouped[key] for key in sorted(grouped, reverse=True)]}
+
+
 @app.get("/api/data-sources/{source_id}/assets")
 def list_assets(
     source_id: str,
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=50, ge=1, le=200),
+    category: str | None = None,
     branch: str | None = None,
     version: str | None = None,
     status_path: list[str] = Query(default=[]),
     search: str | None = None,
 ):
-    _source_or_404(source_id)
-    items, total = repository.list_assets(source_id, skip, limit, branch, version, status_path, search)
+    source = _source_or_404(source_id)
+    mappings = source.options.get("dataset_mappings", [])
+    if mappings and (category or branch or version):
+        candidates, _ = repository.list_assets(source_id, 0, 10_000_000, None, None, status_path, search)
+        candidates = [asset for asset in candidates if (
+            (dataset := _asset_dataset(source, asset.hierarchy))
+            and (not category or dataset[0] == category)
+            and (not branch or dataset[1] == branch)
+            and (not version or dataset[2] == version)
+        )]
+        total = len(candidates)
+        items = candidates[skip : skip + limit]
+    else:
+        items, total = repository.list_assets(source_id, skip, limit, branch, version, status_path, search)
     return {"items": items, "total": total, "skip": skip, "limit": limit}
 
 
@@ -262,7 +367,7 @@ def list_assets(
 def source_hierarchy(source_id: str):
     source = _source_or_404(source_id)
     assets, _ = repository.list_assets(source_id, 0, 10_000_000)
-    branches: dict[str, dict[str, int]] = {}
+    categories: dict[str, dict[str, dict[str, int]]] = {}
     route_counts: dict[str, int] = {}
     directory_paths: set[str] = {Path(source.endpoint).name}
     for asset in assets:
@@ -271,23 +376,31 @@ def source_hierarchy(source_id: str):
             continue
         for depth in range(1, len(parts) + 1):
             directory_paths.add("/".join([Path(source.endpoint).name, *parts[:depth]]))
-        branch = parts[0]
-        versions = branches.setdefault(branch, {})
-        version = next((part for part in parts[1:] if re.fullmatch(r"\d{8}", part)), None)
-        versions[version or "未识别版本"] = versions.get(version or "未识别版本", 0) + 1
+        dataset = _asset_dataset(source, asset.hierarchy)
+        if dataset:
+            category, branch, version = dataset
+            versions = categories.setdefault(category, {}).setdefault(branch, {})
+            versions[version] = versions.get(version, 0) + 1
         normalized = [part for part in parts if not re.fullmatch(r"\d{8}", part)]
         for depth in range(2, len(normalized) + 1):
             route = "/".join(normalized[:depth])
             route_counts[route] = route_counts.get(route, 0) + 1
     return {
-        "type": Path(source.endpoint).name,
+        "type": " / ".join(categories) if len(categories) <= 2 else f"AI 已识别 {len(categories)} 个大类",
+        "categories": [
+            {"name": category, "count": sum(sum(versions.values()) for versions in branches.values()), "branches": [
+                {"name": branch, "count": sum(versions.values()), "versions": [{"name": version, "count": count} for version, count in sorted(versions.items(), reverse=True)]}
+                for branch, versions in sorted(branches.items())
+            ]}
+            for category, branches in sorted(categories.items())
+        ],
         "branches": [
             {
                 "name": name,
                 "count": sum(versions.values()),
                 "versions": [{"name": version, "count": count} for version, count in sorted(versions.items(), reverse=True)],
             }
-            for name, versions in sorted(branches.items())
+            for name, versions in sorted({branch: versions for branches in categories.values() for branch, versions in branches.items()}.items())
         ],
         "status_paths": source.options.get("status_paths", []),
         "examples": source.options.get("hierarchy_examples", {}),
@@ -296,6 +409,8 @@ def source_hierarchy(source_id: str):
             {"path": path, "count": count}
             for path, count in sorted(route_counts.items())
         ],
+        "dataset_mappings": source.options.get("dataset_mappings", []),
+        "hierarchy_analysis": source.options.get("hierarchy_analysis", {}),
     }
 
 
@@ -314,6 +429,160 @@ def update_hierarchy_config(source_id: str, payload: HierarchyConfig):
     }
     source.updated_at = utc_now()
     return repository.save_source(source)
+
+
+@app.post("/api/data-sources/{source_id}/hierarchy/analyze")
+def analyze_source_hierarchy(source_id: str):
+    source = _source_or_404(source_id)
+    assets, _ = repository.list_assets(source.id, 0, 10_000_000)
+    if not assets:
+        raise HTTPException(status_code=422, detail="请先为数据源建立索引")
+    directory_counts: dict[str, int] = {}
+    for asset in assets:
+        if asset.hierarchy:
+            path = "/".join(asset.hierarchy)
+            directory_counts[path] = directory_counts.get(path, 0) + 1
+    file_samples = [
+        {"directory": "/".join(asset.hierarchy), "filename": asset.filename}
+        for asset in assets
+        if re.search(r"(?:icon|crop|tile|piece|[_-][0-9]+)", asset.filename, re.IGNORECASE)
+    ][:60]
+    try:
+        result = analyze_data_hierarchy(source.name, directory_counts, source.options.get("hierarchy_examples", {}), file_samples)
+    except (ValueError, RuntimeError) as error:
+        raise HTTPException(status_code=422, detail=str(error)) from error
+    source.options = {
+        **source.options,
+        "dataset_mappings": result["mappings"],
+        "association_rules": result.get("association_rules", {}),
+        "hierarchy_analysis": {key: value for key, value in result.items() if key != "mappings"},
+    }
+    source.updated_at = utc_now()
+    repository.save_source(source)
+    reindexed = _synchronize_source(source_id, include_assets=False)
+    return {
+        **result,
+        "dataset_count": len({(item["category"], item["branch"], item["version"]) for item in result["mappings"]}),
+        "reindexed_assets": reindexed.asset_count,
+    }
+
+
+def _asset_dataset(source: DataSource, hierarchy: list[str]) -> tuple[str, str, str] | None:
+    parts = [part for part in hierarchy if part not in {"", ".", ".."}]
+    relative_directory = "/".join(parts)
+    mappings = sorted(source.options.get("dataset_mappings", []), key=lambda item: len(str(item.get("path_prefix", ""))), reverse=True)
+    for mapping in mappings:
+        prefix = str(mapping.get("path_prefix", "")).replace("\\", "/").strip("/")
+        if relative_directory == prefix or relative_directory.startswith(f"{prefix}/"):
+            values = tuple(str(mapping.get(key, "")).replace("\\", "/").strip("/").split("/")[-1] for key in ("category", "branch", "version"))
+            if all(values):
+                return values
+    if len(parts) >= 3:
+        return parts[0], parts[1], parts[2]
+    if len(parts) >= 2:
+        return Path(source.endpoint).name, parts[0], parts[1]
+    return None
+
+
+def _source_datasets(source: DataSource):
+    assets, _ = repository.list_assets(source.id, 0, 10_000_000)
+    grouped: dict[tuple[str, str, str], dict[str, int | str]] = {}
+    for asset in assets:
+        dataset = _asset_dataset(source, asset.hierarchy)
+        if not dataset:
+            continue
+        entry = grouped.setdefault(dataset, {
+            "category": dataset[0], "branch": dataset[1], "version": dataset[2],
+            "image_count": 0, "annotation_count": 0,
+        })
+        entry["image_count"] = int(entry["image_count"]) + 1
+        if asset.xml:
+            entry["annotation_count"] = int(entry["annotation_count"]) + 1
+    return sorted(grouped.values(), key=lambda item: (str(item["category"]), str(item["branch"]), str(item["version"])), reverse=True)
+
+
+@app.get("/api/data-sources/{source_id}/datasets")
+def source_datasets(source_id: str):
+    source = _source_or_404(source_id)
+    return {"items": _source_datasets(source)}
+
+
+@app.post("/api/data-sources/{source_id}/storage-sync")
+def synchronize_to_storage(source_id: str, payload: StorageSyncRequest):
+    source = _source_or_404(source_id)
+    if source.type != SourceType.LOCAL:
+        raise HTTPException(status_code=501, detail="当前仅支持本地数据源同步到标准目录")
+    storage = repository.get_storage()
+    if storage.type != "local":
+        raise HTTPException(status_code=501, detail="当前仅支持本地标准目录")
+    source_root = Path(source.endpoint).expanduser().resolve()
+    storage_root = Path(storage.endpoint).expanduser().resolve()
+    if not source_root.is_dir():
+        raise HTTPException(status_code=422, detail="数据源目录不存在或不可访问")
+    storage_root.mkdir(parents=True, exist_ok=True)
+
+    assets, _ = repository.list_assets(source.id, 0, 10_000_000)
+    if not assets:
+        result = scan_local_source(source.id, source.endpoint, include_assets=True, association_rules=source.options.get("association_rules"))
+        assets = result.assets
+        repository.replace_assets(source.id, assets)
+    selected = None if not payload.dataset else (
+        payload.dataset.category, payload.dataset.branch, payload.dataset.version,
+    )
+    copied = skipped = updated = annotations = groups = companions = 0
+    datasets: set[tuple[str, str, str]] = set()
+    for asset in assets:
+        if asset.role != "primary":
+            continue
+        dataset = _asset_dataset(source, asset.hierarchy)
+        if not dataset or (selected and dataset != selected):
+            continue
+        datasets.add(dataset)
+        destination_dir = storage_root.joinpath(*dataset).resolve()
+        if not destination_dir.is_relative_to(storage_root):
+            raise HTTPException(status_code=422, detail="数据集标准路径无效")
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        groups += 1
+        group_paths = [asset.relative_path, *asset.companion_images]
+        companions += len(asset.companion_images)
+        for relative_path in group_paths:
+            source_image = (source_root / relative_path).resolve()
+            if not source_image.is_relative_to(source_root) or not source_image.is_file():
+                continue
+            destination_image = destination_dir / source_image.name
+            if destination_image.exists() and not payload.overwrite:
+                skipped += 1
+            else:
+                existed = destination_image.exists()
+                shutil.copy2(source_image, destination_image)
+                updated += int(existed)
+                copied += int(not existed)
+        if asset.xml:
+            source_xml = (source_root / asset.xml.path).resolve()
+            destination_xml = destination_dir / f"{Path(asset.relative_path).stem}.xml"
+            if source_xml.is_relative_to(source_root) and source_xml.is_file():
+                if destination_xml.exists() and not payload.overwrite:
+                    skipped += 1
+                else:
+                    existed = destination_xml.exists()
+                    shutil.copy2(source_xml, destination_xml)
+                    updated += int(existed)
+                    copied += int(not existed)
+                    annotations += 1
+    if selected and not datasets:
+        raise HTTPException(status_code=404, detail="所选数据集不存在或尚未建立索引")
+    return {
+        "source_id": source.id,
+        "dataset_count": len(datasets),
+        "copied": copied,
+        "updated": updated,
+        "skipped": skipped,
+        "annotations": annotations,
+        "groups": groups,
+        "companions": companions,
+        "overwrite": payload.overwrite,
+        "storage_path": str(storage_root),
+    }
 
 
 @app.get("/api/data-sources/{source_id}/content")
@@ -347,17 +616,18 @@ def asset_content(source_id: str, asset_id: str):
 @app.post("/api/data-sources/{source_id}/assets/{asset_id}/annotation")
 def save_asset_annotation(source_id: str, asset_id: str, payload: AnnotationSaveRequest):
     source = _source_or_404(source_id)
+    if source.type != SourceType.LOCAL:
+        raise HTTPException(status_code=501, detail="当前仅支持保存本地图像标注")
     asset = repository.get_asset(source_id, asset_id)
     if not asset:
         raise HTTPException(status_code=404, detail="图像资产不存在")
-    storage = repository.get_storage()
-    if storage.type != "local":
-        raise HTTPException(status_code=501, detail="当前仅支持保存到本地受管存储")
-    root = Path(storage.endpoint).expanduser().resolve()
-    target = (root / source.name / Path(asset.relative_path).with_suffix(".xml")).resolve()
+    root = Path(source.endpoint).expanduser().resolve()
+    image_path = (root / asset.relative_path).resolve()
+    target = image_path.with_suffix(".xml")
     if not target.is_relative_to(root):
         raise HTTPException(status_code=422, detail="标注输出路径无效")
-    target.parent.mkdir(parents=True, exist_ok=True)
+    if not image_path.is_file():
+        raise HTTPException(status_code=404, detail="原始图像不存在或已移动")
 
     annotation = ET.Element("annotation")
     ET.SubElement(annotation, "filename").text = asset.filename
@@ -378,10 +648,13 @@ def save_asset_annotation(source_id: str, asset_id: str, payload: AnnotationSave
             ET.SubElement(box, key).text = str(value)
         parsed_objects.append({"id": f"xml-{index}", "label": item.label, "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax})
     ET.indent(annotation, space="  ")
-    ET.ElementTree(annotation).write(target, encoding="utf-8", xml_declaration=True)
+    try:
+        ET.ElementTree(annotation).write(target, encoding="utf-8", xml_declaration=True)
+    except OSError as error:
+        raise HTTPException(status_code=422, detail="图像目录不可写，无法保存标注") from error
 
     classes = Counter(item.label for item in payload.objects)
-    asset.xml = XmlSummary(path=str(target), object_count=len(payload.objects), classes=dict(classes), image_width=payload.image_width, image_height=payload.image_height, objects=parsed_objects)
+    asset.xml = XmlSummary(path=target.relative_to(root).as_posix(), object_count=len(payload.objects), classes=dict(classes), image_width=payload.image_width, image_height=payload.image_height, objects=parsed_objects)
     repository.save_asset(asset)
     return {"ok": True, "path": str(target), "object_count": len(payload.objects)}
 
@@ -389,6 +662,40 @@ def save_asset_annotation(source_id: str, asset_id: str, payload: AnnotationSave
 @app.get("/api/storage", response_model=StorageConfig)
 def get_storage() -> StorageConfig:
     return repository.get_storage()
+
+
+@app.get("/api/storage/assets")
+def storage_assets(skip: int = Query(default=0, ge=0), limit: int = Query(default=48, ge=1, le=200), search: str | None = None):
+    storage = repository.get_storage()
+    if storage.type != "local":
+        raise HTTPException(status_code=501, detail="当前仅支持浏览本地标准目录")
+    root = Path(storage.endpoint).expanduser().resolve()
+    if not root.is_dir():
+        return {"items": [], "total": 0, "image_count": 0, "annotation_count": 0}
+    result = scan_local_source("managed-storage", str(root), include_assets=True)
+    assets = [asset for asset in result.assets if asset.role == "primary"]
+    if search:
+        needle = search.lower()
+        assets = [asset for asset in assets if needle in asset.filename.lower() or needle in asset.relative_path.lower()]
+    return {
+        "items": assets[skip : skip + limit],
+        "total": len(assets),
+        "image_count": result.image_count,
+        "annotation_count": sum(1 for asset in assets if asset.xml),
+    }
+
+
+@app.get("/api/storage/content")
+def storage_content(path: str = Query(..., min_length=1)):
+    storage = repository.get_storage()
+    if storage.type != "local":
+        raise HTTPException(status_code=501, detail="当前仅支持浏览本地标准目录")
+    root = Path(storage.endpoint).expanduser().resolve()
+    target = (root / path).resolve()
+    image_suffixes = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".gif", ".tif", ".tiff"}
+    if not target.is_relative_to(root) or not target.is_file() or target.suffix.lower() not in image_suffixes:
+        raise HTTPException(status_code=404, detail="标准图像不存在或已移动")
+    return FileResponse(target)
 
 
 @app.put("/api/storage", response_model=StorageConfig)

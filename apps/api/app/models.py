@@ -130,5 +130,22 @@ class StorageConfig(BaseModel):
     updated_at: datetime = Field(default_factory=utc_now)
 
 
+class DatasetSelection(BaseModel):
+    category: str = Field(min_length=1, max_length=160)
+    branch: str = Field(min_length=1, max_length=160)
+    version: str = Field(min_length=1, max_length=160)
+
+
+class StorageSyncRequest(BaseModel):
+    dataset: DatasetSelection | None = None
+    overwrite: bool = False
+
+    @model_validator(mode="after")
+    def overwrite_requires_dataset(self) -> "StorageSyncRequest":
+        if self.overwrite and not self.dataset:
+            raise ValueError("覆盖同步前必须选择单个数据集")
+        return self
+
+
 class ReviewRequest(BaseModel):
     status: str = Field(pattern="^(verified|incorrect|captured)$")

@@ -42,6 +42,7 @@ import {
   SlidersHorizontal,
   TableProperties,
   TestTube2,
+  Trash2,
   WandSparkles,
   Workflow,
   X,
@@ -76,7 +77,7 @@ const nav = [
 ] as const;
 const subNav: Record<View, string[]> = {
   overview: ["运行总览", "图像巡检", "数据链路", "来源分析"],
-  preprocess: ["数据管理", "图像浏览", "人工标注", "批量工具", "导入导出"],
+  preprocess: ["数据管理", "图像浏览", "人工标注", "工具集", "数据同步"],
   solutions: ["方案库", "新数据评估", "提示词", "实验记录"],
   models: ["能力列表", "接入与适配", "版本与配置", "调度记录"],
   postprocess: ["结果资产", "人工复核", "收纳规则", "导出任务"],
@@ -674,6 +675,10 @@ function DataManagement() {
   const [credentialProfile, setCredentialProfile] = useState("");
   const [busy, setBusy] = useState<string>();
   const [message, setMessage] = useState("");
+  const [managedAssets, setManagedAssets] = useState<IndexedAsset[]>([]);
+  const [managedTotal, setManagedTotal] = useState(0);
+  const [managedAnnotationCount, setManagedAnnotationCount] = useState(0);
+  const [managedSelectedId, setManagedSelectedId] = useState("");
   const [directoryOpen, setDirectoryOpen] = useState(false);
   const [directoryPath, setDirectoryPath] = useState("");
   const [directoryParent, setDirectoryParent] = useState<string | null>(null);
@@ -694,14 +699,22 @@ function DataManagement() {
   ) as Record<ManagedSource["type"], (typeof sourceTypes)[number]>;
 
   async function loadSources() {
-    const [sourceResponse, storageResponse] = await Promise.all([
+    const [sourceResponse, storageResponse, assetsResponse] = await Promise.all([
       fetch("/api/data-sources"),
       fetch("/api/storage"),
+      fetch("/api/storage/assets?limit=24"),
     ]);
     if (sourceResponse.ok) setSources(await sourceResponse.json());
     if (storageResponse.ok) {
       const storage = (await storageResponse.json()) as { endpoint: string };
       setStoragePath(storage.endpoint);
+    }
+    if (assetsResponse.ok) {
+      const result = await assetsResponse.json() as { items: IndexedAsset[]; total: number; annotation_count: number };
+      setManagedAssets(result.items);
+      setManagedTotal(result.total);
+      setManagedAnnotationCount(result.annotation_count);
+      setManagedSelectedId((current) => result.items.some((item) => item.id === current) ? current : result.items[0]?.id || "");
     }
   }
   useEffect(() => {
@@ -796,6 +809,21 @@ function DataManagement() {
     setBusy(undefined);
   }
 
+  async function deleteSource(source: ManagedSource) {
+    if (!window.confirm(`删除数据源“${source.name}”及其索引？原目录和标准资产不会被删除。`)) return;
+    setBusy(source.id);
+    setMessage("");
+    const response = await fetch(`/api/data-sources/${source.id}`, { method: "DELETE" });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      setMessage(result.detail || "删除数据源失败");
+    } else {
+      setMessage("数据源及其索引已删除；原目录和标准资产保持不变");
+      await loadSources();
+    }
+    setBusy(undefined);
+  }
+
   const filteredSources = sources.filter((source) =>
     `${source.name} ${source.endpoint} ${source.type}`
       .toLowerCase()
@@ -816,7 +844,7 @@ function DataManagement() {
           <small>数据中心入口</small>
           <h2>统一管理原始数据与标准数据</h2>
           <p>
-            原始数据源保持只读；平台只保存索引、映射、配置与操作记录，处理后的标准数据写入指定受管存储。
+            数据源以索引关联为主，人工标注 XML 可在图像旁原位维护；整理后的核心资产写入标准目录。
           </p>
         </div>
         <button className="btn primary" onClick={() => setAddOpen(true)}>
@@ -830,9 +858,9 @@ function DataManagement() {
             <LockKeyhole size={18} />
           </i>
           <span>
-            <small>原始数据源 · 只读</small>
+            <small>原始数据源 · 索引接入</small>
             <strong>本地目录 / OSS / MinIO / Redis / MongoDB</strong>
-            <em>读取文件、对象、缓存记录或图像链接，不修改源数据</em>
+            <em>读取文件、对象或图像链接；本地图像允许维护同名 XML</em>
           </span>
         </article>
         <ArrowRight size={18} />
@@ -909,9 +937,10 @@ function DataManagement() {
                 <i className={busy === source.id ? "syncing" : ""} />
                 {busy === source.id ? "处理中" : statusLabel(source)}
               </div>
-              <button disabled={Boolean(busy)} onClick={() => syncSource(source)}>
-                {actionLabel(source.type)} <ChevronRight size={13} />
-              </button>
+              <div className="source-actions">
+                <button disabled={Boolean(busy)} title={actionLabel(source.type)} onClick={() => syncSource(source)}><RefreshCw size={13} /></button>
+                <button disabled={Boolean(busy)} className="danger" title="删除数据源" onClick={() => deleteSource(source)}><Trash2 size={13} /></button>
+              </div>
             </article>
           )})}
         </main>
@@ -959,6 +988,15 @@ function DataManagement() {
           </footer>
         </aside>
       </section>
+      <ManagedStorageBrowser
+        assets={managedAssets}
+        total={managedTotal}
+        annotationCount={managedAnnotationCount}
+        selectedId={managedSelectedId}
+        onSelect={setManagedSelectedId}
+        onRefresh={loadSources}
+        storagePath={storagePath}
+      />
       {addOpen && (
         <div className="import-backdrop" onMouseDown={() => setAddOpen(false)}>
           <section
@@ -969,7 +1007,7 @@ function DataManagement() {
               <span>
                 <small>只读接入</small>
                 <h2>添加数据源</h2>
-                <p>选择来源类型并配置连接，平台不会修改源端内容。</p>
+                <p>相同连接位置会复用已有记录，避免重复来源。</p>
               </span>
               <button onClick={() => setAddOpen(false)}>
                 <X size={16} />
@@ -1074,8 +1112,8 @@ function DataManagement() {
               <label className="readonly-check">
                 <input type="checkbox" defaultChecked />
                 <span>
-                  <b>只读接入</b>
-                  <small>禁止平台写入或删除源数据</small>
+                  <b>索引接入</b>
+                  <small>不移动图像；人工标注可维护同目录 XML</small>
                 </span>
               </label>
             </div>
@@ -1171,6 +1209,41 @@ function DataManagement() {
       )}
     </div>
   );
+}
+
+function ManagedStorageBrowser({ assets, total, annotationCount, selectedId, onSelect, onRefresh, storagePath }: {
+  assets: IndexedAsset[];
+  total: number;
+  annotationCount: number;
+  selectedId: string;
+  onSelect: (id: string) => void;
+  onRefresh: () => void;
+  storagePath: string;
+}) {
+  const selected = assets.find((asset) => asset.id === selectedId) || assets[0];
+  const contentUrl = (path: string) => `/api/storage/content?path=${encodeURIComponent(path)}`;
+  return <section className="managed-browser">
+    <header>
+      <span><small>核心标准目录</small><h3>标准图像与标注文档</h3><p>{storagePath}</p></span>
+      <div><em>{total} 张图像</em><em>{annotationCount} 份 XML</em><button className="btn" onClick={onRefresh}><RefreshCw size={13} />刷新</button></div>
+    </header>
+    {!assets.length ? <div className="managed-empty"><Archive size={22} /><b>标准目录暂无图像</b><span>导入或导出完成后，规范化资产会在这里统一浏览和继续加工。</span></div> : <div className="managed-browser-body">
+      <div className="managed-grid">
+        {assets.map((asset) => <button className={selected?.id === asset.id ? "selected" : ""} onClick={() => onSelect(asset.id)} key={asset.id}>
+          <div><img src={contentUrl(asset.relative_path)} loading="lazy" />{asset.xml && <em>XML</em>}</div>
+          <strong>{asset.filename}</strong><small>{asset.hierarchy.join(" / ") || "标准目录根级"}</small>
+        </button>)}
+      </div>
+      <aside>
+        {selected && <><div className="managed-preview"><img src={contentUrl(selected.relative_path)} /></div><h4>{selected.filename}</h4><dl>
+          <div><dt>标准路径</dt><dd>{selected.relative_path}</dd></div>
+          <div><dt>分类层级</dt><dd>{selected.hierarchy.join(" / ") || "根级"}</dd></div>
+          <div><dt>XML 标注</dt><dd>{selected.xml ? `${selected.xml.object_count} 个目标` : "暂无标注"}</dd></div>
+          <div><dt>类别</dt><dd>{selected.xml ? Object.keys(selected.xml.classes).join("、") || "无目标" : "—"}</dd></div>
+        </dl><p><CircleCheck size={12} />资产按标准相对路径唯一管理，不依赖原数据源记录。</p></>}
+      </aside>
+    </div>}
+  </section>;
 }
 
 function ImageDataCenter({ page }: { page: number }) {
@@ -1368,6 +1441,7 @@ type IndexedAsset = {
 
 type DataViewSession = {
   sourceId: string;
+  category: string;
   branch: string;
   version: string;
   statuses: string[];
@@ -1379,6 +1453,7 @@ type DataViewSession = {
 
 const dataViewSession: DataViewSession = {
   sourceId: "",
+  category: "",
   branch: "",
   version: "",
   statuses: [],
@@ -1386,6 +1461,14 @@ const dataViewSession: DataViewSession = {
   strategy: "primary",
   search: "",
   page: 0,
+};
+
+const annotationViewSession = {
+  sourceId: "",
+  branch: "",
+  version: "",
+  statuses: [] as string[],
+  selectedAssetId: "",
 };
 
 type SearchableSelectOption = {
@@ -1418,9 +1501,11 @@ function SearchableSelect({
   const inputRef = useRef<HTMLInputElement>(null);
   const selectedOption = options.find((option) => option.value === value);
   const normalizedQuery = query.trim().toLowerCase();
-  const filteredOptions = options.filter((option) =>
+  const filteredOptions = useMemo(() => options.filter((option) =>
     !normalizedQuery || `${option.label} ${option.keywords || ""}`.toLowerCase().includes(normalizedQuery),
-  );
+  ), [options, normalizedQuery]);
+  const optionLimit = normalizedQuery ? 80 : 40;
+  const visibleOptions = filteredOptions.slice(0, optionLimit);
   const displayValue = open ? query : selectedOption?.label || "";
 
   function select(nextValue: string) {
@@ -1431,7 +1516,6 @@ function SearchableSelect({
 
   return (
     <div className={`filter-select ${open ? "open" : ""} ${className}`.trim()}>
-      <Search size={12} />
       <input
         ref={inputRef}
         aria-label={ariaLabel}
@@ -1452,7 +1536,8 @@ function SearchableSelect({
       <ChevronRight className="filter-select-chevron" size={13} />
       {open && <div className="filter-select-menu" role="listbox">
         {emptyLabel && !normalizedQuery && <button type="button" className={!value ? "selected" : ""} onMouseDown={(event) => event.preventDefault()} onClick={() => select("")}><span>{emptyLabel}</span>{!value && <Check size={12} />}</button>}
-        {filteredOptions.map((option) => <button type="button" className={option.value === value ? "selected" : ""} role="option" aria-selected={option.value === value} key={option.value} onMouseDown={(event) => event.preventDefault()} onClick={() => select(option.value)}><span>{option.label}</span>{option.value === value && <Check size={12} />}</button>)}
+        {visibleOptions.map((option) => <button type="button" className={option.value === value ? "selected" : ""} role="option" aria-selected={option.value === value} key={option.value} onMouseDown={(event) => event.preventDefault()} onClick={() => select(option.value)}><span>{option.label}</span>{option.value === value && <Check size={12} />}</button>)}
+        {filteredOptions.length > visibleOptions.length && <small className="filter-select-more">还有 {filteredOptions.length - visibleOptions.length} 项，请输入关键词缩小范围</small>}
         {!filteredOptions.length && <small>没有匹配项</small>}
       </div>}
     </div>
@@ -1462,9 +1547,10 @@ function SearchableSelect({
 function IndexedImageBrowser() {
   const [sources, setSources] = useState<ManagedSource[]>([]);
   const [sourceId, setSourceId] = useState(dataViewSession.sourceId);
+  const [category, setCategory] = useState(dataViewSession.category);
   const [branch, setBranch] = useState(dataViewSession.branch);
   const [version, setVersion] = useState(dataViewSession.version);
-  const [hierarchyInfo, setHierarchyInfo] = useState<{ type: string; branches: { name: string; count: number; versions: { name: string; count: number }[] }[]; status_paths: string[]; examples: { type?: string; branch?: string; version?: string }; directory_paths: string[] } | null>(null);
+  const [hierarchyInfo, setHierarchyInfo] = useState<{ type: string; branches: { name: string; count: number; versions: { name: string; count: number }[] }[]; categories?: { name: string; count: number; branches: { name: string; count: number; versions: { name: string; count: number }[] }[] }[]; status_paths: string[]; examples: { type?: string; branch?: string; version?: string }; directory_paths: string[]; dataset_mappings?: unknown[]; hierarchy_analysis?: { summary?: string; provider?: string } } | null>(null);
   const [examples, setExamples] = useState({ type: "", branch: "", version: "" });
   const [selectedStatuses, setSelectedStatuses] = useState<string[]>([...dataViewSession.statuses]);
   const [statusDraft, setStatusDraft] = useState("");
@@ -1476,11 +1562,13 @@ function IndexedImageBrowser() {
   const [page, setPage] = useState(dataViewSession.page);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(false);
+  const [analyzingHierarchy, setAnalyzingHierarchy] = useState(false);
+  const [hierarchyMessage, setHierarchyMessage] = useState("");
   const pageSize = 48;
 
   useEffect(() => {
-    Object.assign(dataViewSession, { sourceId, branch, version, statuses: [...selectedStatuses], selectedAssetId: selectedId, strategy, search, page });
-  }, [sourceId, branch, version, selectedStatuses, selectedId, strategy, search, page]);
+    Object.assign(dataViewSession, { sourceId, category, branch, version, statuses: [...selectedStatuses], selectedAssetId: selectedId, strategy, search, page });
+  }, [sourceId, category, branch, version, selectedStatuses, selectedId, strategy, search, page]);
 
   useEffect(() => {
     fetch("/api/data-sources")
@@ -1490,6 +1578,7 @@ function IndexedImageBrowser() {
         setSources(indexed);
         if (sourceId && !indexed.some((item) => item.id === sourceId)) {
           setSourceId("");
+          setCategory("");
           setBranch("");
           setVersion("");
           setSelectedStatuses([]);
@@ -1507,13 +1596,15 @@ function IndexedImageBrowser() {
 
   useEffect(() => {
     if (!sourceId || (branch && !version)) return;
+    const controller = new AbortController();
     setLoading(true);
     const params = new URLSearchParams({ skip: String(page * pageSize), limit: String(pageSize) });
+    if (category) params.set("category", category);
     if (branch) params.set("branch", branch);
     if (version) params.set("version", version);
     if (search) params.set("search", search);
     selectedStatuses.forEach((path) => params.append("status_path", path));
-    fetch(`/api/data-sources/${sourceId}/assets?${params}`)
+    fetch(`/api/data-sources/${sourceId}/assets?${params}`, { signal: controller.signal })
       .then((response) => response.json())
       .then((result: { items: IndexedAsset[]; total: number }) => {
         setAssets(result.items);
@@ -1522,27 +1613,31 @@ function IndexedImageBrowser() {
           result.items.some((item) => item.id === current) ? current : result.items[0]?.id || "",
         );
       })
-      .finally(() => setLoading(false));
-  }, [sourceId, branch, version, page, search, selectedStatuses]);
+      .catch((error) => { if (error.name !== "AbortError") setAssets([]); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [sourceId, category, branch, version, page, search, selectedStatuses]);
 
   useEffect(() => {
     if (!sourceId || !branch || version || !hierarchyInfo) { setVersionGroups([]); return; }
-    const versions = hierarchyInfo.branches.find((item) => item.name === branch)?.versions || [];
+    const controller = new AbortController();
     setLoading(true);
-    Promise.all(versions.map(async (item) => {
-      const params = new URLSearchParams({ branch, version: item.name, limit: "10" });
-      if (search) params.set("search", search);
-      selectedStatuses.forEach((path) => params.append("status_path", path));
-      const response = await fetch(`/api/data-sources/${sourceId}/assets?${params}`);
-      const result = await response.json() as { items: IndexedAsset[]; total: number };
-      return { version: item.name, total: result.total, items: result.items };
-    })).then((groups) => {
+    const params = new URLSearchParams({ branch, limit_per_version: "10" });
+    if (category) params.set("category", category);
+    if (search) params.set("search", search);
+    selectedStatuses.forEach((path) => params.append("status_path", path));
+    fetch(`/api/data-sources/${sourceId}/version-previews?${params}`, { signal: controller.signal })
+      .then((response) => response.json())
+      .then((result: { items: { version: string; total: number; items: IndexedAsset[] }[] }) => {
+      const groups = result.items;
       setVersionGroups(groups.filter((group) => group.total > 0));
       const groupedItems = groups.flatMap((group) => group.items);
       setSelectedId((current) => groupedItems.some((item) => item.id === current) ? current : groupedItems[0]?.id || "");
       setTotal(groups.reduce((sum, group) => sum + group.total, 0));
-    }).finally(() => setLoading(false));
-  }, [sourceId, branch, version, hierarchyInfo, search, selectedStatuses]);
+    }).catch((error) => { if (error.name !== "AbortError") setVersionGroups([]); })
+      .finally(() => { if (!controller.signal.aborted) setLoading(false); });
+    return () => controller.abort();
+  }, [sourceId, category, branch, version, hierarchyInfo, search, selectedStatuses]);
 
   const source = sources.find((item) => item.id === sourceId);
   const isCompanion = (asset: IndexedAsset) =>
@@ -1564,11 +1659,25 @@ function IndexedImageBrowser() {
   const combination = selected
     ? `${selected.companion_images.length ? `大图 + ${selected.companion_images.length} 张小图` : "只有大图"}${selected.xml ? " + XML" : ""}`
     : "—";
-  const branchInfo = hierarchyInfo?.branches.find((item) => item.name === branch);
+  const categoryInfo = hierarchyInfo?.categories?.find((item) => item.name === category);
+  const availableBranches = categoryInfo?.branches || hierarchyInfo?.branches || [];
+  const branchInfo = availableBranches.find((item) => item.name === branch);
   async function saveHierarchy(paths = hierarchyInfo?.status_paths || []) {
     await fetch(`/api/data-sources/${sourceId}/hierarchy-config`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ type_example: examples.type, branch_example: examples.branch, version_example: examples.version, status_paths: paths }) });
     setHierarchyInfo((current) => current ? { ...current, status_paths: paths } : current);
     setSelectedStatuses((current) => current.filter((path) => paths.includes(path)));
+  }
+  async function analyzeHierarchy() {
+    setAnalyzingHierarchy(true); setHierarchyMessage("");
+    const response = await fetch(`/api/data-sources/${sourceId}/hierarchy/analyze`, { method: "POST" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) setHierarchyMessage(body.detail || "AI 目录分析失败");
+    else {
+      const refreshed = await fetch(`/api/data-sources/${sourceId}/hierarchy`).then((result) => result.json());
+      setHierarchyInfo(refreshed); setCategory(""); setBranch(""); setVersion(""); setPage(0);
+      setHierarchyMessage(`AI 已识别 ${body.dataset_count} 个标准数据集，共生成 ${body.mappings.length} 条目录映射 · ${body.input_image_count} 张图像归并为 ${body.input_directory_count} 个目录，实际送审 ${body.prompt_directory_count} 条`);
+    }
+    setAnalyzingHierarchy(false);
   }
   const annotationColor = (label: string) => ["#e34f62", "#238bcb", "#dc8a16", "#6f55c7", "#1c9772"][Math.abs(Number.parseInt(label, 10) || 0) % 5];
   const annotationBoxes = (asset: IndexedAsset) => asset.xml?.image_width && asset.xml.image_height
@@ -1626,16 +1735,19 @@ function IndexedImageBrowser() {
           value={sourceId}
           placeholder="选择或输入类型 / 数据集"
           options={sources.map((item) => ({ value: item.id, label: item.name, keywords: item.endpoint }))}
-          onChange={(nextValue) => { setSourceId(nextValue); setBranch(""); setVersion(""); setSelectedStatuses([]); setPage(0); }}
+          onChange={(nextValue) => { setSourceId(nextValue); setCategory(""); setBranch(""); setVersion(""); setSelectedStatuses([]); setPage(0); }}
         />
       </section>
       {sourceId && hierarchyInfo && <section className="hierarchy-examples">
-        <header><span><small>层级示例</small><b>从真实目录中指定类型、分支和版本</b></span><em>三项可以选择同一路径</em></header>
+        <header><span><small>AI 层级分析</small><b>允许同一数据源包含多套类型 / 分支 / 版本规范</b></span><button className="btn" disabled={analyzingHierarchy} onClick={analyzeHierarchy}><WandSparkles size={13} />{analyzingHierarchy ? "分析中..." : "AI 分析目录"}</button></header>
+        {hierarchyMessage && <div className="hierarchy-ai-message">{hierarchyMessage}</div>}
+        {hierarchyInfo.hierarchy_analysis?.summary && <div className="hierarchy-ai-summary"><CircleCheck size={13} />{hierarchyInfo.hierarchy_analysis.summary}</div>}
         {(["type", "branch", "version"] as const).map((key) => <label key={key}><span>{{ type: "类型示例", branch: "分支示例", version: "版本示例" }[key]}</span><select value={examples[key]} onChange={(event) => setExamples((current) => ({ ...current, [key]: event.target.value }))}><option value="">请选择目录</option>{hierarchyInfo.directory_paths.map((path) => <option value={path} key={`${key}-${path}`}>\{path.replaceAll("/", "\\")}</option>)}</select></label>)}
         <button className="btn primary" disabled={!examples.type || !examples.branch || !examples.version} onClick={() => saveHierarchy()}>保存层级示例</button>
       </section>}
       {sourceId && <section className="hierarchy-control">
-        <label className="searchable-select"><span>分支</span><SearchableSelect ariaLabel="分支" value={branch} placeholder="全部分支，可输入筛选" emptyLabel="全部分支" options={(hierarchyInfo?.branches || []).map((item) => ({ value: item.name, label: `${item.name} (${item.count})`, keywords: item.name }))} onChange={(nextValue) => { setBranch(nextValue); setVersion(""); setPage(0); }} /></label>
+        <label className="searchable-select"><span>类型</span><SearchableSelect ariaLabel="类型" value={category} placeholder="全部类型，可输入筛选" emptyLabel="全部类型" options={(hierarchyInfo?.categories || []).map((item) => ({ value: item.name, label: `${item.name} (${item.count})`, keywords: item.name }))} onChange={(nextValue) => { setCategory(nextValue); setBranch(""); setVersion(""); setPage(0); }} /></label>
+        <label className="searchable-select"><span>分支</span><SearchableSelect ariaLabel="分支" value={branch} disabled={Boolean(hierarchyInfo?.categories?.length) && !category} placeholder={category || !hierarchyInfo?.categories?.length ? "全部分支，可输入筛选" : "请先选择类型"} emptyLabel="全部分支" options={availableBranches.map((item) => ({ value: item.name, label: `${item.name} (${item.count})`, keywords: item.name }))} onChange={(nextValue) => { setBranch(nextValue); setVersion(""); setPage(0); }} /></label>
         <label className="searchable-select"><span>版本</span><SearchableSelect ariaLabel="版本" value={version} disabled={!branch} placeholder={branch ? "全部版本，可输入筛选" : "请先选择分支"} emptyLabel="全部版本" options={(branchInfo?.versions || []).map((item) => ({ value: item.name, label: `${item.name} (${item.count})`, keywords: item.name }))} onChange={(nextValue) => { setVersion(nextValue); setPage(0); }} /></label>
         <div className="status-filter"><span>状态（勾选后只看对应内容）</span><div>{hierarchyInfo?.status_paths.length ? hierarchyInfo.status_paths.map((path) => <label key={path}><input type="checkbox" checked={selectedStatuses.includes(path)} onChange={() => setSelectedStatuses((current) => current.includes(path) ? current.filter((item) => item !== path) : [...current, path])} /><b>{path}</b><button title="删除状态" onClick={() => saveHierarchy(hierarchyInfo.status_paths.filter((item) => item !== path))}>×</button></label>) : <small>尚未添加状态</small>}</div></div>
         <div className="status-add"><input value={statusDraft} onChange={(event) => setStatusDraft(event.target.value)} placeholder="例如 unsolved、test、train" /><button className="btn" disabled={!statusDraft.trim()} onClick={() => { const status = statusDraft.trim().replace(/[\\/]/g, ""); if (status && hierarchyInfo) saveHierarchy([...new Set([...hierarchyInfo.status_paths, status])]); setStatusDraft(""); }}>添加状态</button></div>
@@ -1665,7 +1777,7 @@ function IndexedImageBrowser() {
       <section className="browser-toolbar">
         <div className="path-crumb">
           <FolderTree size={15} />
-          <span>{hierarchyInfo?.type || "类型"}</span>{branch && <span className="crumb-part"><ChevronRight size={12} /> {branch}</span>}{version && <span className="crumb-part"><ChevronRight size={12} /> {version}</span>}
+          <span>{category || hierarchyInfo?.type || "类型"}</span>{branch && <span className="crumb-part"><ChevronRight size={12} /> {branch}</span>}{version && <span className="crumb-part"><ChevronRight size={12} /> {version}</span>}
         </div>
         <label><Search size={14} /><input aria-label={`筛选${strategyLabel}名称`} value={search} onChange={(event) => { setSearch(event.target.value); setPage(0); }} placeholder={`输入名称筛选${strategyLabel}`} /></label>
       </section>
@@ -1802,10 +1914,11 @@ function ManualAnnotation() {
   const [index, setIndex] = useState(0);
   const [annotationAssets, setAnnotationAssets] = useState<IndexedAsset[]>([]);
   const [annotationSources, setAnnotationSources] = useState<ManagedSource[]>([]);
-  const [annotationSourceId, setAnnotationSourceId] = useState(dataViewSession.sourceId);
-  const [annotationBranch, setAnnotationBranch] = useState(dataViewSession.branch);
-  const [annotationVersion, setAnnotationVersion] = useState(dataViewSession.version);
-  const [annotationStatuses, setAnnotationStatuses] = useState<string[]>([...dataViewSession.statuses]);
+  const inheritedBrowserSource = dataViewSession.sourceId;
+  const [annotationSourceId, setAnnotationSourceId] = useState(inheritedBrowserSource || annotationViewSession.sourceId);
+  const [annotationBranch, setAnnotationBranch] = useState(inheritedBrowserSource ? dataViewSession.branch : annotationViewSession.branch);
+  const [annotationVersion, setAnnotationVersion] = useState(inheritedBrowserSource ? dataViewSession.version : annotationViewSession.version);
+  const [annotationStatuses, setAnnotationStatuses] = useState<string[]>(inheritedBrowserSource ? [...dataViewSession.statuses] : [...annotationViewSession.statuses]);
   const [annotationHierarchy, setAnnotationHierarchy] = useState<{ branches: { name: string; versions: { name: string }[] }[]; status_paths: string[] } | null>(null);
   const [zoom, setZoom] = useState(1);
   const [modelMode, setModelMode] = useState<"none" | "general" | "professional">("none");
@@ -1861,8 +1974,8 @@ function ManualAnnotation() {
       .then((sources: ManagedSource[]) => {
         const indexed = sources.filter((item) => item.asset_count > 0);
         setAnnotationSources(indexed);
-        if (!annotationSourceId || !indexed.some((item) => item.id === annotationSourceId)) {
-          setAnnotationSourceId(indexed[0]?.id || "");
+        if (annotationSourceId && !indexed.some((item) => item.id === annotationSourceId)) {
+          setAnnotationSourceId("");
           setAnnotationBranch("");
           setAnnotationVersion("");
           setAnnotationStatuses([]);
@@ -1871,22 +1984,22 @@ function ManualAnnotation() {
   }, []);
 
   useEffect(() => {
-    Object.assign(dataViewSession, {
+    Object.assign(annotationViewSession, {
       sourceId: annotationSourceId,
       branch: annotationBranch,
       version: annotationVersion,
       statuses: [...annotationStatuses],
-      selectedAssetId: currentAsset?.id || dataViewSession.selectedAssetId,
+      selectedAssetId: currentAsset?.id || annotationViewSession.selectedAssetId,
     });
   }, [annotationSourceId, annotationBranch, annotationVersion, annotationStatuses, currentAsset?.id]);
 
   useEffect(() => {
-    if (!annotationSourceId) return;
+    if (!annotationSourceId) { setAnnotationHierarchy(null); return; }
     fetch(`/api/data-sources/${annotationSourceId}/hierarchy`).then((response) => response.json()).then(setAnnotationHierarchy);
   }, [annotationSourceId]);
 
   useEffect(() => {
-    if (!annotationSourceId) return;
+    if (!annotationSourceId) { setAnnotationAssets([]); setIndex(0); return; }
     const params = new URLSearchParams({ limit: "200" });
     if (annotationBranch) params.set("branch", annotationBranch);
     if (annotationVersion) params.set("version", annotationVersion);
@@ -1896,7 +2009,8 @@ function ManualAnnotation() {
       .then((result: { items: IndexedAsset[] }) => {
         const primaryAssets = result.items.filter((asset) => asset.role === "primary");
         setAnnotationAssets(primaryAssets);
-        const synchronizedIndex = primaryAssets.findIndex((asset) => asset.id === dataViewSession.selectedAssetId);
+        const inheritedAssetId = annotationViewSession.selectedAssetId || dataViewSession.selectedAssetId;
+        const synchronizedIndex = primaryAssets.findIndex((asset) => asset.id === inheritedAssetId);
         setIndex(synchronizedIndex >= 0 ? synchronizedIndex : 0);
         setEditedBoxes({});
         setSavedSamples([]);
@@ -2036,14 +2150,15 @@ function ManualAnnotation() {
     }
   }
   return (
-    <div className="annotation-page">
+    <div className={`annotation-page ${annotationSourceId ? "" : "unselected"}`.trim()}>
       <section className="annotation-dataset-bar">
-        <label><span>类型 / 数据集</span><select value={annotationSourceId} onChange={(event) => { setAnnotationSourceId(event.target.value); setAnnotationBranch(""); setAnnotationVersion(""); setAnnotationStatuses([]); }}>{annotationSources.map((source) => <option value={source.id} key={source.id}>{source.name}</option>)}</select></label>
+        <label><span>类型 / 数据集</span><select value={annotationSourceId} onChange={(event) => { setAnnotationSourceId(event.target.value); setAnnotationBranch(""); setAnnotationVersion(""); setAnnotationStatuses([]); }}><option value="">请选择类型 / 数据集</option>{annotationSources.map((source) => <option value={source.id} key={source.id}>{source.name}</option>)}</select></label>
         <label><span>分支</span><select value={annotationBranch} onChange={(event) => { setAnnotationBranch(event.target.value); setAnnotationVersion(""); }}><option value="">全部分支</option>{annotationHierarchy?.branches.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label>
         <label><span>版本</span><select value={annotationVersion} disabled={!annotationBranch} onChange={(event) => setAnnotationVersion(event.target.value)}><option value="">全部版本</option>{branchVersions.map((item) => <option value={item.name} key={item.name}>{item.name}</option>)}</select></label>
         <div className="annotation-statuses"><span>状态</span><div>{annotationHierarchy?.status_paths.map((status) => <label key={status}><input type="checkbox" checked={annotationStatuses.includes(status)} onChange={() => setAnnotationStatuses((current) => current.includes(status) ? current.filter((item) => item !== status) : [...current, status])} />{status}</label>)}{!annotationHierarchy?.status_paths.length && <small>未配置状态</small>}</div></div>
         <div className="zoom-control"><span>画布缩放</span><div><button title="缩小" onClick={() => setZoom((value) => Math.max(0.5, value - 0.1))}><ZoomOut size={14} /></button><input type="range" min="50" max="200" value={Math.round(zoom * 100)} onChange={(event) => setZoom(Number(event.target.value) / 100)} /><b>{Math.round(zoom * 100)}%</b><button title="放大" onClick={() => setZoom((value) => Math.min(2, value + 0.1))}><ZoomIn size={14} /></button></div></div>
       </section>
+      <section className="annotation-unselected"><ImageIcon size={24} /><b>尚未选择标注内容</b><span>请先在图像浏览中选择数据，或在上方主动选择类型 / 数据集。</span></section>
       <section className="annotation-toolbar">
         <div>
           <button className="btn">
@@ -2146,10 +2261,22 @@ function ManualAnnotation() {
         </aside>
         <main>
           <div className="annotation-canvas">
-            <div className="annotation-stage" ref={stageRef} style={{ transform: `scale(${zoom})` }} onPointerDown={beginDraw} onPointerMove={movePointer} onPointerUp={finishPointer}>
-              {currentAsset && <img src={`/api/data-sources/${currentAsset.source_id}/assets/${currentAsset.id}/content`} draggable={false} onLoad={(event) => { const assetId = currentAsset.id; const width = event.currentTarget.naturalWidth; const height = event.currentTarget.naturalHeight; setImageDimensions((current) => ({ ...current, [assetId]: { width, height } })); }} />}
-              {boxes.filter((box) => !hiddenBoxIds.includes(box.id)).map((box) => <span className={`bbox ${selectedBoxId === box.id ? "selected" : ""}`} style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, height: `${box.height}%`, "--box-color": boxColor(box.label) } as React.CSSProperties} onPointerDown={(event) => beginMove(event, box)} key={box.id}><b>{box.label}</b>{selectedBoxId === box.id && <i className="resize-handle" onPointerDown={(event) => beginResize(event, box)} />}</span>)}
-              {draftBox && <span className="bbox draft" style={{ left: `${draftBox.x}%`, top: `${draftBox.y}%`, width: `${draftBox.width}%`, height: `${draftBox.height}%` }} />}
+            <div className="annotation-primary">
+              <div className="annotation-stage" ref={stageRef} style={{ transform: `scale(${zoom})` }} onPointerDown={beginDraw} onPointerMove={movePointer} onPointerUp={finishPointer}>
+                {currentAsset && <img src={`/api/data-sources/${currentAsset.source_id}/assets/${currentAsset.id}/content`} draggable={false} onLoad={(event) => { const assetId = currentAsset.id; const width = event.currentTarget.naturalWidth; const height = event.currentTarget.naturalHeight; setImageDimensions((current) => ({ ...current, [assetId]: { width, height } })); }} />}
+                {boxes.filter((box) => !hiddenBoxIds.includes(box.id)).map((box) => <span className={`bbox ${selectedBoxId === box.id ? "selected" : ""}`} style={{ left: `${box.x}%`, top: `${box.y}%`, width: `${box.width}%`, height: `${box.height}%`, "--box-color": boxColor(box.label) } as React.CSSProperties} onPointerDown={(event) => beginMove(event, box)} key={box.id}><b>{box.label}</b>{selectedBoxId === box.id && <i className="resize-handle" onPointerDown={(event) => beginResize(event, box)} />}</span>)}
+                {draftBox && <span className="bbox draft" style={{ left: `${draftBox.x}%`, top: `${draftBox.y}%`, width: `${draftBox.width}%`, height: `${draftBox.height}%` }} />}
+              </div>
+              {objectCount === 0 && (
+                <div className="no-annotation">
+                  <CircleAlert size={18} />
+                  <strong>{currentAsset ? `未找到 ${currentAsset.filename.replace(/\.[^.]+$/, ".xml")}` : "正在读取标注数据"}</strong>
+                  <span>{modelConfigured ? (autoEnabled ? `将调用 ${modelLabel} 生成候选标注` : "自动预标注已关闭，可直接人工标注") : "当前为简单标注，不调用任何模型或服务"}</span>
+                  <button className="btn primary" onClick={modelConfigured ? () => setEditedBoxes((current) => ({ ...current, [index]: sourceBoxes })) : addManualObject}>
+                    {modelConfigured ? <Play size={13} /> : <Plus size={13} />}{modelConfigured ? "立即预标注" : "添加第一个目标"}
+                  </button>
+                </div>
+              )}
             </div>
             <aside className="annotation-references">
               <header><span><small>数据组参考</small><b>关联小图</b></span><em>{currentAsset?.companion_images.length || 0}</em></header>
@@ -2160,21 +2287,6 @@ function ManualAnnotation() {
                 </figure>)}
               </div> : <p>当前主图没有关联小图</p>}
             </aside>
-            {objectCount === 0 && (
-              <div className="no-annotation">
-                <CircleAlert size={18} />
-                <strong>{currentAsset ? `未找到 ${currentAsset.filename.replace(/\.[^.]+$/, ".xml")}` : "正在读取标注数据"}</strong>
-                <span>
-                  {modelConfigured
-                    ? (autoEnabled ? `将调用 ${modelLabel} 生成候选标注` : "自动预标注已关闭，可直接人工标注")
-                    : "当前为简单标注，不调用任何模型或服务"}
-                </span>
-                <button className="btn primary" onClick={modelConfigured ? () => setEditedBoxes((current) => ({ ...current, [index]: sourceBoxes })) : addManualObject}>
-                  {modelConfigured ? <Play size={13} /> : <Plus size={13} />}
-                  {modelConfigured ? "立即预标注" : "添加第一个目标"}
-                </button>
-              </div>
-            )}
             <span className="canvas-hint">在图像上拖拽创建目标框 · 拖动已有框调整位置</span>
           </div>
           <footer>
@@ -2510,188 +2622,213 @@ function ToolLibrary() {
 
 function FavoriteTools() {
   const [picker, setPicker] = useState(false);
-  const favorites = [
-    [
-      "image-rename",
-      "批量改名",
-      FileInput,
-      "脚本",
-      "默认规则：序号 + 原扩展名",
-    ],
-    ["image-deduplicate", "图像去重", Boxes, "算法", "默认规则：pHash 0.92"],
-    ["batch-crop", "批量剪切", Scissors, "脚本", "默认规则：使用 XML bbox"],
-    [
-      "geometry-matching-v2",
-      "批量自动标注",
-      WandSparkles,
-      "模型",
-      "默认输出：Pascal VOC",
-    ],
-    ["remove-background", "智能去背景", Eraser, "服务", "默认输出：透明 PNG"],
-    ["voc-converter", "格式转换", RefreshCw, "脚本", "默认输出：VOC / YOLO"],
-  ] as const;
-  const available = [
-    ["image-resize", "图像缩放", "脚本"],
-    ["quality-check", "图像质量检测", "算法"],
-    ["vision-review-api", "结果复核", "服务"],
-  ];
+  const [tools, setTools] = useState<StoredCapability[]>([]);
+  const [published, setPublished] = useState<StoredCapability[]>([]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [pickerIds, setPickerIds] = useState<string[]>([]);
+  const [message, setMessage] = useState("");
+  const [loading, setLoading] = useState(true);
+  const available = published.filter((item) => !tools.some((tool) => tool.id === item.id));
+  const iconFor = (type: string) => ({ 模型: WandSparkles, 算法: Boxes, 脚本: FileInput, 工具: Workflow, 服务: Server }[type] || Workflow);
+  async function loadToolSet() {
+    setLoading(true);
+    const [toolResponse, capabilityResponse] = await Promise.all([fetch("/api/tool-set"), fetch("/api/capabilities")]);
+    if (!toolResponse.ok || !capabilityResponse.ok) {
+      setMessage("工具集或能力中心读取失败");
+      setLoading(false);
+      return;
+    }
+    const toolResult = await toolResponse.json() as { items: StoredCapability[] };
+    const capabilities = await capabilityResponse.json() as StoredCapability[];
+    setTools(toolResult.items);
+    setPublished(capabilities.filter((item) => item.status === "published"));
+    setSelectedIds((current) => current.filter((id) => toolResult.items.some((item) => item.id === id)));
+    setLoading(false);
+  }
+  useEffect(() => { loadToolSet(); }, []);
+  function toggleSelected(id: string) {
+    setSelectedIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id]);
+  }
+  async function removeSelected() {
+    if (!selectedIds.length || !window.confirm(`从工具集移除选中的 ${selectedIds.length} 项？能力中心内容不会受影响。`)) return;
+    const response = await fetch("/api/tool-set", { method: "DELETE", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capability_ids: selectedIds }) });
+    const result = await response.json().catch(() => ({})) as { items?: StoredCapability[]; removed_count?: number; detail?: string };
+    if (!response.ok) { setMessage(result.detail || "工具移除失败"); return; }
+    setTools(result.items || []);
+    setMessage(`已从工具集移除 ${result.removed_count || 0} 项，能力中心内容保持不变`);
+    setSelectedIds([]);
+  }
+  async function addPicked() {
+    const response = await fetch("/api/tool-set", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capability_ids: pickerIds }) });
+    const result = await response.json().catch(() => ({})) as { items?: StoredCapability[]; added_count?: number; detail?: string };
+    if (!response.ok) { setMessage(result.detail || "工具添加失败"); return; }
+    setTools(result.items || []);
+    setMessage(`已从能力中心添加 ${result.added_count || 0} 项工具引用`);
+    setPickerIds([]);
+    setPicker(false);
+  }
   return (
     <div className="stack">
       <section className="tool-hero">
         <div>
-          <small>当前项目常用能力</small>
-          <h2>批量工具</h2>
+          <small>流程与 Agent 可用能力</small>
+          <h2>工具集</h2>
           <p>
-            从能力中心收藏本项目需要的能力，并为批量任务配置默认参数；移除收藏不会删除底层能力。
+            工具由流程或 llm_agent 选择调用；此处仅管理引用，删除不会影响能力中心内容。
           </p>
         </div>
-        <button className="btn primary" onClick={() => setPicker(true)}>
-          <Plus size={14} />
-          从能力中心添加
-        </button>
+        <button className="btn primary" onClick={() => setPicker(true)}><Plus size={14} />从能力中心添加</button>
       </section>
+      {message && <div className="source-message"><CircleCheck size={13} />{message}</div>}
       <section className="favorite-note">
-        <Archive size={15} />
-        <span>
-          <b>6 个常用能力</b>
-          <small>
-            底层版本与适配由能力中心统一维护，这里只保存项目引用和默认参数。
-          </small>
-        </span>
-        <button>管理默认参数</button>
+        <div className="tool-set-actions">
+          {!!tools.length && <label className="tool-select-all"><input type="checkbox" checked={selectedIds.length === tools.length} ref={(input) => { if (input) input.indeterminate = selectedIds.length > 0 && selectedIds.length < tools.length; }} onChange={() => setSelectedIds(selectedIds.length === tools.length ? [] : tools.map((item) => item.id))} /><span>{selectedIds.length === tools.length ? "取消全选" : "全选"}</span></label>}
+          {!!selectedIds.length && <button className="btn" onClick={removeSelected}><Trash2 size={13} />删除所选 ({selectedIds.length})</button>}
+        </div>
+        <div className="tool-set-summary">
+          <Archive size={15} />
+          <span>
+            <b>{tools.length} 个工具 · 已选择 {selectedIds.length} 个</b>
+            <small>底层版本与适配由能力中心统一维护，这里只保存项目引用和默认参数。</small>
+          </span>
+        </div>
       </section>
-      <div className="tool-grid">
-        {favorites.map(([id, name, Icon, type, config], i) => (
-          <article key={id}>
+      {loading && <section className="browser-empty"><RefreshCw className="spin" /><b>正在读取工具集</b></section>}
+      {!loading && !tools.length && <section className="browser-empty"><Workflow size={24} /><b>工具集为空</b><span>从能力中心添加已发布能力后，可供流程或 llm_agent 选择。</span></section>}
+      <div className="capability-grid tool-set-capability-grid">
+        {tools.map((tool, i) => {
+          const Icon = iconFor(tool.type);
+          const typeClass = capabilityTypeClass[tool.type] || "other";
+          return (
+          <article className={`capability-card type-${typeClass} ${selectedIds.includes(tool.id) ? "selected" : ""}`} onClick={() => toggleSelected(tool.id)} key={tool.id}>
             <header>
-              <i className={`tool-icon t${i}`}>
+              <i className={`cap-icon type-${typeClass}`}>
                 <Icon size={18} />
               </i>
-              <em>已收藏</em>
+              <span className={`cap-type-badge type-${typeClass}`}>{tool.type}</span>
+              <label title="选择工具" onClick={(event) => event.stopPropagation()}><input type="checkbox" checked={selectedIds.includes(tool.id)} onChange={() => toggleSelected(tool.id)} /></label>
             </header>
-            <h3>{name}</h3>
-            <p>{config}</p>
-            <small className="cap-reference">能力中心 / {id}</small>
+            <h3>{tool.name}</h3>
+            <code>{tool.invocation || "待配置调用方式"}</code>
+            <p>{tool.summary || tool.project_summary || "能力中心未填写说明"}</p>
+            <div className="candidate-tags">{tool.categories?.map((tag) => <em key={tag} style={categoryTagStyle(tag)}>{tag}</em>)}</div>
             <footer>
-              <span>{type}</span>
-              <button>
-                创建任务 <ChevronRight size={13} />
-              </button>
+              <span>{tool.status === "published" ? "已发布" : "已停用"}</span>
+              <em>供流程 / llm_agent 选择</em>
             </footer>
           </article>
-        ))}
+        )})}
       </div>
-      <section className="panel batch-jobs">
-        <Head
-          title="最近批量任务"
-          sub="常用能力的调度记录与产出"
-          action="查看全部"
-        />
-        <div className="job-row head">
-          <span>任务</span>
-          <span>使用能力</span>
-          <span>数据量</span>
-          <span>状态</span>
-          <span>产出</span>
-        </div>
-        <div className="job-row">
-          <span>
-            <i className="job-dot" />
-            <b>几何样本 XML 解析</b>
-          </span>
-          <span>geometry-matching-v2</span>
-          <span>28</span>
-          <span>已完成</span>
-          <strong>28 XML</strong>
-        </div>
-      </section>
-      {picker && (
-        <div className="import-backdrop" onMouseDown={() => setPicker(false)}>
-          <section
-            className="cap-picker"
-            onMouseDown={(e) => e.stopPropagation()}
-          >
-            <header>
-              <span>
-                <small>能力中心</small>
-                <h2>添加常用能力</h2>
-                <p>选择已发布能力加入当前项目，不复制也不修改底层能力。</p>
-              </span>
-              <button onClick={() => setPicker(false)}>
-                <X size={16} />
-              </button>
-            </header>
-            <label>
-              <Search size={14} />
-              <input placeholder="搜索能力名称、类型或用途" />
-            </label>
-            <div>
-              {available.map(([id, name, type]) => (
-                <article key={id}>
-                  <input type="checkbox" />
-                  <span>
-                    <b>{name}</b>
-                    <small>
-                      {id} · {type}
-                    </small>
-                  </span>
-                  <em>可用</em>
-                </article>
-              ))}
-            </div>
-            <footer>
-              <button className="btn" onClick={() => setPicker(false)}>
-                取消
-              </button>
-              <button className="btn primary">添加到批量工具</button>
-            </footer>
-          </section>
-        </div>
-      )}
+      {picker && <div className="import-backdrop" onMouseDown={() => setPicker(false)}>
+        <section className="cap-picker" onMouseDown={(event) => event.stopPropagation()}>
+          <header>
+            <span><small>能力中心</small><h2>添加到工具集</h2><p>选择能力引用到工具集，不复制或修改能力中心内容。</p></span>
+            <button onClick={() => setPicker(false)}><X size={16} /></button>
+          </header>
+          <div>
+            {available.map(({ id, name, type, summary }) => <article key={id}>
+              <input type="checkbox" checked={pickerIds.includes(id)} onChange={() => setPickerIds((current) => current.includes(id) ? current.filter((item) => item !== id) : [...current, id])} />
+              <span><b>{name}</b><small>{id} · {type}{summary ? ` · ${summary}` : ""}</small></span><em>已发布</em>
+            </article>)}
+            {!available.length && <div className="directory-empty">能力中心中的可用工具已全部加入</div>}
+          </div>
+          <footer>
+            <button className="btn" onClick={() => setPicker(false)}>取消</button>
+            <button className="btn primary" disabled={!pickerIds.length} onClick={addPicked}>添加所选 ({pickerIds.length})</button>
+          </footer>
+        </section>
+      </div>}
     </div>
   );
 }
 
 function ImportExport() {
+  type SyncDataset = { category: string; branch: string; version: string; image_count: number; annotation_count: number };
+  type SyncResult = { source_id: string; dataset_count: number; copied: number; updated: number; skipped: number; annotations: number; storage_path: string };
+  const [sources, setSources] = useState<ManagedSource[]>([]);
+  const [sourceId, setSourceId] = useState("");
+  const [datasets, setDatasets] = useState<SyncDataset[]>([]);
+  const [datasetKey, setDatasetKey] = useState("");
+  const [overwrite, setOverwrite] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState("");
+  const [history, setHistory] = useState<Array<SyncResult & { source_name: string; dataset: string; time: string }>>([]);
+  useEffect(() => {
+    fetch("/api/data-sources").then((response) => response.json()).then((items: ManagedSource[]) => {
+      const localSources = items.filter((item) => item.type === "local");
+      setSources(localSources);
+      setSourceId((current) => current || localSources[0]?.id || "");
+    }).catch(() => setMessage("无法读取数据源"));
+  }, []);
+  useEffect(() => {
+    setDatasetKey(""); setOverwrite(false); setDatasets([]);
+    if (!sourceId) return;
+    fetch(`/api/data-sources/${sourceId}/datasets`).then(async (response) => {
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "无法读取数据集");
+      setDatasets(body.items || []);
+    }).catch((error) => setMessage(error.message));
+  }, [sourceId]);
+  const selectedDataset = datasets.find((item) => JSON.stringify([item.category, item.branch, item.version]) === datasetKey);
+  async function analyzeSyncHierarchy() {
+    if (!sourceId) return;
+    setBusy(true); setMessage("");
+    const response = await fetch(`/api/data-sources/${sourceId}/hierarchy/analyze`, { method: "POST" });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) setMessage(body.detail || "AI 目录分析失败");
+    else {
+      const refreshed = await fetch(`/api/data-sources/${sourceId}/datasets`).then((result) => result.json());
+      setDatasets(refreshed.items || []); setDatasetKey(""); setOverwrite(false);
+      setMessage(`AI 已识别 ${body.dataset_count} 个标准数据集；${body.input_image_count} 张图像归并为 ${body.input_directory_count} 个目录，实际送审 ${body.prompt_directory_count} 条`);
+    }
+    setBusy(false);
+  }
+  async function synchronize() {
+    if (!sourceId) return;
+    setBusy(true); setMessage("");
+    const response = await fetch(`/api/data-sources/${sourceId}/storage-sync`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ dataset: selectedDataset ? { category: selectedDataset.category, branch: selectedDataset.branch, version: selectedDataset.version } : null, overwrite }),
+    });
+    const body = await response.json().catch(() => ({}));
+    if (!response.ok) setMessage(body.detail || "数据同步失败");
+    else {
+      const sourceName = sources.find((item) => item.id === sourceId)?.name || sourceId;
+      const dataset = selectedDataset ? `${selectedDataset.category} / ${selectedDataset.branch} / ${selectedDataset.version}` : "全部数据集";
+      setHistory((current) => [{ ...body, source_name: sourceName, dataset, time: new Date().toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }) }, ...current]);
+      setMessage(`同步完成：新增 ${body.copied}，更新 ${body.updated}，跳过重复 ${body.skipped}`);
+    }
+    setBusy(false);
+  }
   return (
     <div className="stack">
-      <section className="io-grid">
-        <article>
-          <i>
-            <Import size={22} />
-          </i>
-          <h2>导入数据</h2>
-          <p>从本地目录导入大图、小图和 XML，先扫描结构，再选择组合规则。</p>
-          <button className="btn primary">选择本地目录</button>
-        </article>
-        <article>
-          <i>
-            <Download size={22} />
-          </i>
-          <h2>导出数据</h2>
-          <p>按原始目录、标准模板或训练集结构导出图像与标注。</p>
-          <button className="btn primary">新建导出任务</button>
-        </article>
+      <section className="sync-workspace">
+        <header><span><small>标准目录录入</small><h2>数据同步</h2><p>AI 可识别同一来源中的多套目录规范，再按“大类 / 分支 / 版本”同步。</p></span><div className="sync-head-actions"><button className="btn" disabled={!sourceId || busy} onClick={analyzeSyncHierarchy}><WandSparkles size={14} />AI 分析目录</button><i><RefreshCw size={22} /></i></div></header>
+        <div className="sync-form">
+          <label><span>数据源</span><select value={sourceId} onChange={(event) => setSourceId(event.target.value)}><option value="">选择本地数据源</option>{sources.map((source) => <option value={source.id} key={source.id}>{source.name}</option>)}</select><small>来源目录保持只读，图像和同名 XML 会录入标准目录。</small></label>
+          <ArrowRight size={18} />
+          <label><span>同步范围</span><select value={datasetKey} onChange={(event) => { setDatasetKey(event.target.value); setOverwrite(false); }} disabled={!sourceId}><option value="">全部数据集（仅新增）</option>{datasets.map((item) => { const key = JSON.stringify([item.category, item.branch, item.version]); return <option value={key} key={key}>{item.category} / {item.branch} / {item.version} · {item.image_count} 图</option>; })}</select><small>{datasets.length ? `识别到 ${datasets.length} 个标准数据集` : "请先在数据管理中为来源建立索引"}</small></label>
+          <ArrowRight size={18} />
+          <div className="sync-target"><span>标准目录</span><b>大类 / 分支 / 版本</b><small>版本以下目录会被消除，文件直接汇总录入。</small></div>
+        </div>
+        <footer>
+          <label className={!selectedDataset ? "disabled" : ""}><input type="checkbox" checked={overwrite} disabled={!selectedDataset} onChange={(event) => setOverwrite(event.target.checked)} /><span><b>覆盖同步更新</b><small>{selectedDataset ? "只更新当前选中的单个数据集" : "选择单个数据集后才可启用"}</small></span></label>
+          <span><CircleAlert size={14} />默认遇到标准目录中的同名文件会跳过，不覆盖已有图像或标注。</span>
+          <button className="btn primary" disabled={!sourceId || busy} onClick={synchronize}>{busy ? <><RefreshCw className="spin" size={14} />同步中...</> : <><RefreshCw size={14} />开始同步</>}</button>
+        </footer>
       </section>
+      {message && <div className="source-message"><CircleCheck size={13} />{message}</div>}
       <section className="panel">
-        <Head title="导入导出记录" sub="最近的数据迁移任务" action="全部记录" />
+        <Head title="本次同步记录" sub="当前页面执行的数据集录入结果" />
         <div className="job-row head">
-          <span>任务</span>
-          <span>模板</span>
-          <span>数据量</span>
-          <span>状态</span>
+          <span>数据源</span>
+          <span>数据集</span>
+          <span>新增 / 更新</span>
+          <span>跳过重复</span>
           <span>时间</span>
         </div>
-        <div className="job-row">
-          <span>
-            <i className="job-dot" />
-            <b>几何匹配数据导入</b>
-          </span>
-          <span>C 型 + VOC</span>
-          <span>28</span>
-          <span>已完成</span>
-          <strong>14:20</strong>
-        </div>
+        {history.map((item, index) => <div className="job-row" key={`${item.time}-${index}`}><span><i className="job-dot" /><b>{item.source_name}</b></span><span>{item.dataset}</span><span>{item.copied} / {item.updated}</span><span>{item.skipped}</span><strong>{item.time}</strong></div>)}
+        {!history.length && <div className="sync-empty"><RefreshCw size={18} /><span>尚未执行同步</span></div>}
       </section>
     </div>
   );
@@ -2761,12 +2898,15 @@ function CapabilityDraftReview({ refresh }: { refresh: boolean }) {
   const [busy, setBusy] = useState(false);
   const [statusFilter, setStatusFilter] = useState<StoredCapability["status"]>("draft");
   const [query, setQuery] = useState("");
+  const [page, setPage] = useState(0);
+  const pageSize = 10;
   const load = () => fetch("/api/capabilities").then((response) => response.json()).then((items: StoredCapability[]) => setRecords(items));
   useEffect(() => { load(); }, [refresh]);
   async function publishApproved() {
     setBusy(true);
-    await Promise.all(approved.map((id) => fetch(`/api/capabilities/${id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ status: "published" }) })));
-    setApproved([]); await load(); setBusy(false);
+    const response = await fetch("/api/capabilities/status", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ capability_ids: approved, status: "published" }) });
+    if (response.ok) setApproved([]);
+    await load(); setBusy(false);
   }
   async function remove(id: string) {
     if (!window.confirm("确定将这项能力移入已删除？之后仍可恢复。")) return;
@@ -2781,18 +2921,39 @@ function CapabilityDraftReview({ refresh }: { refresh: boolean }) {
   const statusMeta: Record<StoredCapability["status"], { label: string; empty: string }> = {
     draft: { label: "未审核", empty: "暂无未审核能力" }, published: { label: "已发布", empty: "暂无已发布能力" }, disabled: { label: "已停用", empty: "暂无已停用能力" }, deleted: { label: "已删除", empty: "暂无已删除能力" },
   };
-  const visible = records.filter((item) => item.status === statusFilter && `${item.name} ${item.type} ${item.summary} ${(item.categories || []).join(" ")} ${item.source_location}`.toLowerCase().includes(query.toLowerCase()));
-  const visibleIds = visible.map((item) => item.id);
-  const allVisibleApproved = visibleIds.length > 0 && visibleIds.every((id) => approved.includes(id));
-  function toggleAllVisible() {
-    setApproved((current) => allVisibleApproved ? current.filter((id) => !visibleIds.includes(id)) : [...new Set([...current, ...visibleIds])]);
+  const capabilityTypeOrder = ["模型", "算法", "脚本", "工具", "服务"];
+  const visible = records
+    .filter((item) => item.status === statusFilter && `${item.name} ${item.type} ${item.summary} ${(item.categories || []).join(" ")} ${item.source_location}`.toLowerCase().includes(query.toLowerCase()))
+    .sort((left, right) => {
+      const leftIndex = capabilityTypeOrder.indexOf(left.type);
+      const rightIndex = capabilityTypeOrder.indexOf(right.type);
+      return (leftIndex < 0 ? capabilityTypeOrder.length : leftIndex) - (rightIndex < 0 ? capabilityTypeOrder.length : rightIndex);
+    });
+  const pageCount = Math.max(1, Math.ceil(visible.length / pageSize));
+  const pageItems = visible.slice(page * pageSize, (page + 1) * pageSize);
+  const pageGroups = pageItems.reduce<Array<{ type: string; items: StoredCapability[] }>>((groups, item) => {
+    const group = groups.find((entry) => entry.type === item.type);
+    if (group) group.items.push(item);
+    else groups.push({ type: item.type, items: [item] });
+    return groups;
+  }, []);
+  const pageIds = pageItems.map((item) => item.id);
+  const selectedOnPage = pageIds.filter((id) => approved.includes(id)).length;
+  const allPageApproved = pageIds.length > 0 && selectedOnPage === pageIds.length;
+  useEffect(() => { if (page >= pageCount) setPage(pageCount - 1); }, [page, pageCount]);
+  function toggleAllOnPage() {
+    setApproved((current) => allPageApproved ? current.filter((id) => !pageIds.includes(id)) : [...new Set([...current, ...pageIds])]);
   }
   return <section className="panel capability-review-panel">
     <header className="review-head"><span><small>人工审核与发布</small><h3>能力审核清单</h3><p>未审核能力不会被业务调用；删除只进入回收状态，可随时恢复。</p></span>{statusFilter === "draft" && <button className="btn primary" disabled={!approved.length || busy} onClick={publishApproved}>{busy ? "发布中..." : `发布所选 (${approved.length})`}</button>}</header>
-    <div className="review-controls"><div>{(Object.keys(statusMeta) as StoredCapability["status"][]).map((status) => <button className={statusFilter === status ? "active" : ""} onClick={() => { setStatusFilter(status); setApproved([]); }} key={status}>{statusMeta[status].label} {records.filter((item) => item.status === status).length}</button>)}</div><span className="review-visible-count">显示 {visible.length} 项</span><label><Search size={13} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="检索名称、类型、标签、来源或摘要" /></label></div>
-    <div className="cap-review-row head"><span>{statusFilter === "draft" ? <label className="review-select-all"><input type="checkbox" checked={allVisibleApproved} disabled={!visible.length} onChange={toggleAllVisible} />全选</label> : "状态"}</span><span>能力</span><span>分类标签</span><span>来源</span><span>操作</span></div>
-    {visible.map((item) => <div className="cap-review-row" key={item.id}><label>{statusFilter === "draft" ? <input type="checkbox" checked={approved.includes(item.id)} onChange={() => setApproved((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])} /> : <i className={`status-dot ${item.status}`} />}</label><span><b>{item.name}</b><small>{item.type} · {item.invocation || "待配置"}</small></span><div>{item.categories?.map((tag) => <em key={tag} style={categoryTagStyle(tag)}>{tag}</em>)}</div><span><b>{item.source_type}</b><small title={item.source_location}>{item.source_location}</small></span><div className="review-actions">{item.status === "published" && <><button title="撤回为未审核" onClick={() => changeStatus(item.id, "draft")}><Archive size={12} /></button><button title="停用能力" onClick={() => changeStatus(item.id, "disabled")}><XCircle size={12} /></button></>}{item.status === "disabled" && <button title="重新发布" onClick={() => changeStatus(item.id, "published")}><Play size={12} /></button>}{item.status === "deleted" ? <button title="恢复到未审核" onClick={() => changeStatus(item.id, "draft")}><RefreshCw size={12} /></button> : <button title="移入已删除" onClick={() => remove(item.id)}><X size={13} /></button>}</div></div>)}
+    <div className="review-controls"><div>{(Object.keys(statusMeta) as StoredCapability["status"][]).map((status) => <button className={statusFilter === status ? "active" : ""} onClick={() => { setStatusFilter(status); setApproved([]); setPage(0); }} key={status}>{statusMeta[status].label} {records.filter((item) => item.status === status).length}</button>)}</div><span className="review-visible-count">显示 {visible.length ? page * pageSize + 1 : 0}–{Math.min((page + 1) * pageSize, visible.length)} / {visible.length} 项</span><label><Search size={13} /><input value={query} onChange={(event) => { setQuery(event.target.value); setPage(0); }} placeholder="检索名称、类型、标签、来源或摘要" /></label></div>
+    <div className="cap-review-row head"><span>{statusFilter === "draft" ? <label className="review-select-all"><input type="checkbox" checked={allPageApproved} ref={(input) => { if (input) input.indeterminate = selectedOnPage > 0 && !allPageApproved; }} disabled={!pageItems.length} onChange={toggleAllOnPage} />全选本页</label> : "状态"}</span><span>能力</span><span>分类标签</span><span>来源</span><span>操作</span></div>
+    {pageGroups.map((group) => <div className="cap-review-group" key={group.type}>
+      <div className={`cap-review-group-head type-${capabilityTypeClass[group.type] || "other"}`}><span>{group.type}</span><small>本页 {group.items.length} 项 · 共 {visible.filter((item) => item.type === group.type).length} 项</small></div>
+      {group.items.map((item) => <div className="cap-review-row" key={item.id}><label>{statusFilter === "draft" ? <input type="checkbox" checked={approved.includes(item.id)} onChange={() => setApproved((current) => current.includes(item.id) ? current.filter((id) => id !== item.id) : [...current, item.id])} /> : <i className={`status-dot ${item.status}`} />}</label><span><b>{item.name}</b><small>{item.type} · {item.invocation || "待配置"}</small></span><div>{item.categories?.map((tag) => <em key={tag} style={categoryTagStyle(tag)}>{tag}</em>)}</div><span><b>{item.source_type}</b><small title={item.source_location}>{item.source_location}</small></span><div className="review-actions">{item.status === "published" && <><button title="撤回为未审核" onClick={() => changeStatus(item.id, "draft")}><Archive size={12} /></button><button title="停用能力" onClick={() => changeStatus(item.id, "disabled")}><XCircle size={12} /></button></>}{item.status === "disabled" && <button title="重新发布" onClick={() => changeStatus(item.id, "published")}><Play size={12} /></button>}{item.status === "deleted" ? <button title="恢复到未审核" onClick={() => changeStatus(item.id, "draft")}><RefreshCw size={12} /></button> : <button title="移入已删除" onClick={() => remove(item.id)}><X size={13} /></button>}</div></div>)}
+    </div>)}
     {!visible.length && <div className="capability-empty"><Workflow size={22} /><b>{statusMeta[statusFilter].empty}</b><span>{query ? "没有匹配当前检索条件的能力。" : statusFilter === "draft" ? "接入来源并完成 AI 分析后，先保存到这里等待审核。" : "该状态下还没有能力记录。"}</span></div>}
+    {!!visible.length && <div className="review-pagination"><span>第 {page + 1} / {pageCount} 页</span><div><button disabled={page === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}><ChevronLeft size={13} /></button><button disabled={page + 1 >= pageCount} onClick={() => setPage((value) => Math.min(pageCount - 1, value + 1))}><ChevronRight size={13} /></button></div></div>}
   </section>;
 }
 function CapabilityGallery() {
@@ -2802,11 +2963,32 @@ function CapabilityGallery() {
   const [records, setRecords] = useState<StoredCapability[]>([]);
   const [filter, setFilter] = useState("全部");
   const [query, setQuery] = useState("");
+  const [expandedTypes, setExpandedTypes] = useState<string[]>([]);
+  const [previewCount, setPreviewCount] = useState(4);
+  const capabilityGroupsRef = useRef<HTMLDivElement>(null);
   const load = () => fetch("/api/capabilities").then((response) => response.json()).then((items: StoredCapability[]) => setRecords(items.filter((item) => item.status === "published" || item.status === "disabled")));
   useEffect(() => { load(); }, [open]);
+  useEffect(() => {
+    const container = capabilityGroupsRef.current;
+    if (!container) return;
+    const update = () => setPreviewCount(Math.max(1, Math.floor((container.clientWidth + 12) / 282)));
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(container);
+    return () => observer.disconnect();
+  }, [filter, records.length]);
   const published = records.filter((item) => (filter === "全部" || item.type === filter) && `${item.name} ${item.summary} ${(item.categories || []).join(" ")}`.toLowerCase().includes(query.toLowerCase()));
+  const capabilityTypes = ["模型", "算法", "脚本", "工具", "服务"];
   const iconFor = (type: string) => ({ 模型: WandSparkles, 算法: Boxes, 脚本: FileInput, 工具: Settings, 服务: Server }[type] || Workflow);
   async function remove(id: string) { if (!window.confirm("确定将这个能力移入已删除？之后可在审核清单中恢复。")) return; await fetch(`/api/capabilities/${id}`, { method: "DELETE" }); await load(); }
+  const capabilityCard = (item: StoredCapability) => { const Icon = iconFor(item.type); const typeClass = capabilityTypeClass[item.type] || "other"; return (
+    <article className={`capability-card type-${typeClass}`} key={item.id}>
+      <header><i className={`cap-icon type-${typeClass}`}><Icon size={18} /></i><span className={`cap-type-badge type-${typeClass}`}>{item.type}</span><button title="删除能力" onClick={() => remove(item.id)}><X size={13} /></button></header>
+      <h3>{item.name}</h3><code>{item.invocation || "待配置调用方式"}</code><p>{item.summary}</p>
+      <div className="candidate-tags">{item.categories?.map((tag) => <em key={tag} style={categoryTagStyle(tag)}>{tag}</em>)}</div>
+      <footer><span>{item.status === "published" ? "已发布" : "已停用"}</span><button onClick={() => setEditing(item)}>编辑配置 <ChevronRight size={13} /></button></footer>
+    </article>
+  ); };
   return (
     <div className="stack">
       <section className="capability-intro">
@@ -2831,28 +3013,12 @@ function CapabilityGallery() {
           <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索能力名称、用途或标签" />
         </label>
       </section>
-      <div className="capability-grid">
-        {published.map((item) => { const Icon = iconFor(item.type); const typeClass = capabilityTypeClass[item.type] || "other"; return (
-          <article className={`capability-card type-${typeClass}`} key={item.id}>
-            <header>
-              <i className={`cap-icon type-${typeClass}`}>
-                <Icon size={18} />
-              </i>
-              <span className={`cap-type-badge type-${typeClass}`}>{item.type}</span>
-              <button title="删除能力" onClick={() => remove(item.id)}><X size={13} /></button>
-            </header>
-            <h3>{item.name}</h3>
-            <code>{item.invocation || "待配置调用方式"}</code>
-            <p>{item.summary}</p>
-            <div className="candidate-tags">{item.categories?.map((tag) => <em key={tag} style={categoryTagStyle(tag)}>{tag}</em>)}</div>
-            <footer>
-              <span>{item.status === "published" ? "已发布" : "已停用"}</span>
-              <button onClick={() => setEditing(item)}>编辑配置 <ChevronRight size={13} /></button>
-            </footer>
-          </article>
-        ); })}
-        {!published.length && <div className="capability-empty"><Boxes size={22} /><b>暂无已发布能力</b><span>先接入来源并在“接入与适配”中审核发布。</span></div>}
-      </div>
+      {filter === "全部" && published.length > 0 ? <div className="capability-groups" ref={capabilityGroupsRef}>
+        {capabilityTypes.map((type) => { const items = published.filter((item) => item.type === type); if (!items.length) return null; const expanded = expandedTypes.includes(type); const visibleItems = expanded ? items : items.slice(0, previewCount); const typeClass = capabilityTypeClass[type] || "other"; return <section className={`capability-group type-${typeClass}`} key={type}>
+          <header><span><i className={`cap-icon type-${typeClass}`}>{(() => { const Icon = iconFor(type); return <Icon size={17} />; })()}</i><span><small>能力分类</small><h2>{type}</h2></span><em>{items.length} 项</em></span>{items.length > previewCount && <button className="btn" onClick={() => setExpandedTypes((current) => expanded ? current.filter((item) => item !== type) : [...current, type])}>{expanded ? "收起" : `展开其余 ${items.length - previewCount} 项`}<ChevronRight className={expanded ? "expanded" : ""} size={14} /></button>}</header>
+          <div className="capability-grid">{visibleItems.map(capabilityCard)}</div>
+        </section>; })}
+      </div> : <div className="capability-grid">{published.map(capabilityCard)}{!published.length && <div className="capability-empty"><Boxes size={22} /><b>暂无匹配能力</b><span>先接入来源并在“接入与适配”中审核发布，或调整当前筛选条件。</span></div>}</div>}
       {open && (
         <CapabilityImport
           source={source}
@@ -2959,6 +3125,7 @@ type StoredCapability = CapabilityCandidate & {
   status: "draft" | "published" | "disabled" | "deleted";
   source_type: CapabilitySource;
   source_location: string;
+  project_summary?: string;
 };
 
 function CapabilityImport({
@@ -2972,6 +3139,7 @@ function CapabilityImport({
 }) {
   const [location, setLocation] = useState("");
   const [preferredType, setPreferredType] = useState("auto");
+  const [splitMode, setSplitMode] = useState("auto");
   const [aiSettings, setAiSettings] = useState({ provider: "openrouter", base_url: "https://openrouter.ai/api/v1", model: "openrouter/auto", configured: false });
   const [taxonomy, setTaxonomy] = useState<Record<string, string[]>>({});
   const [busy, setBusy] = useState(false);
@@ -2995,7 +3163,7 @@ function CapabilityImport({
     setResult(null);
     setImported(false);
     try {
-      const response = await fetch("/api/capabilities/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_type: source, location: location.trim(), preferred_type: preferredType, group: "auto" }) });
+      const response = await fetch("/api/capabilities/analyze", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ source_type: source, location: location.trim(), preferred_type: preferredType, group: splitMode }) });
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || "来源分析失败");
       setResult(body);
@@ -3013,6 +3181,7 @@ function CapabilityImport({
       const body = await response.json();
       if (!response.ok) throw new Error(body.detail || "能力录入失败");
       setImported(true);
+      close();
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "能力录入失败");
     } finally { setBusy(false); }
@@ -3068,8 +3237,14 @@ function CapabilityImport({
                 <option value="auto">自动识别</option><option>模型</option><option>算法</option><option>脚本</option><option>工具</option><option>服务</option>
               </select>
             </label>
-            <div className="auto-category-note"><WandSparkles size={14} /><span><b>AI 自动分类</b><small>按每项能力分别生成 1–4 个功能标签</small></span></div>
+            <label>
+              <span>拆分方式</span>
+              <select value={splitMode} onChange={(event) => setSplitMode(event.target.value)}>
+                <option value="auto">自动判断仓库形态</option><option value="collection">能力集合 · 逐项识别</option><option value="project">单一项目 · 主入口</option><option value="client">服务客户端 / SDK</option>
+              </select>
+            </label>
           </div>
+          <div className="auto-category-note"><WandSparkles size={14} /><span><b>入口优先分析</b><small>启动文件、CLI 和公开服务入口优先；测试、示例与普通文档只作为证据</small></span></div>
           {!result && <div className="parse-hint">
             <Workflow size={15} />
             <span>
